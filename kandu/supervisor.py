@@ -27,11 +27,11 @@ from .flights import Flights
 from .github import TOKENS_LABEL, GitHubError, blockers_in, branch_for, task_blockers, transient
 from .mirror import open_github
 from .notify import CHECK_NOT_RUN, LIVE_DOWN, TESTS_FAIL_IN, notifier_for
-from .runner import CLAUDE, DEFAULT_LOGS_DIR, LocalWork, Runner, RunnerError, Unreachable
+from .runner import CLAUDE, CODEX, DEFAULT_LOGS_DIR, LocalWork, Runner, RunnerError, Unreachable
 from .state import StateStore
 from .tasks import TaskError
 from .tries import FAILURE_COMMENT, INTERNAL_TRIES, SIZING_FAILURE_COMMENT, count as count_tries
-from .usage import UsageError, over_limit, read_usage
+from .usage import UsageError, over_limit, read_codex_usage, read_usage
 
 BACKLOG, READY, IN_PROGRESS, IN_REVIEW = "Backlog", "Ready", "In progress", "In review"
 NEEDS_INFO, BLOCKED, DONE = "Needs info", "Blocked", "Done"
@@ -218,17 +218,20 @@ def _at_work(item, events, github):
 
 class Supervisor:
     def __init__(self, config, store, github, runner, usage_reader, local_dir=DEFAULT_LOCAL_DIR, now=None,
-                 sleep=time.sleep, flights=None):
+                 sleep=time.sleep, flights=None, codex_reader=read_codex_usage):
         self.config = config
         self.flights = flights or Flights(config, store)  # the free flights, which the merge cleanup may end
         self.store = store
         self.github = github
         self.runner = runner
         self.usage_reader = usage_reader
+        self.codex_reader = codex_reader
         self.local_dir = local_dir
         self.now = now or (lambda: datetime.now().astimezone())
         self.deadline = None
         self.usage = None
+        self.codex_usage = None
+        self.usage_held = {}  # agent CLI -> why its runs wait this cycle: its usage limit, or its usage unread
         self.halt_reason = None
         self.queen_trouble = None
         self.queen_run = None
@@ -243,6 +246,7 @@ class Supervisor:
         self.sleep = sleep
         self.next_wake = None
         self._lock = threading.Lock()
+        self._codex_lock = threading.Lock()
         self._deploy_locks = defaultdict(threading.Lock)
 
     def _is_paused(self, project):
@@ -318,12 +322,32 @@ class Supervisor:
         """True when running agents must be killed: the deadline passed or the user pressed stop."""
         return self.now() >= self.deadline or self.stop_file.exists()
 
-    def _gate(self):
-        """Returns why no agent may start now, or None."""
+    def _stop_reason(self):
+        """Why no agent of any CLI may start now, or None."""
         if self.stop_file.exists():
             return "stopped by the user"
         if self.deadline is not None and self.now() >= self.deadline:
             return "cycle time is up"
+        return None
+
+    def _gate(self):
+        """Returns why no Claude agent may start now, or None."""
+        return self._stop_reason() or self._usage_limit(CLAUDE)
+
+    def _usage_limit(self, cli):
+        """Why no run of `cli` may start now for its own usage, or None: each agent CLI has its own limits, and
+        is held by nothing of the other's. While a project uses Codex, a held CLI stays held for the rest of the
+        cycle; without one, every run reads Claude's usage again, as it always has."""
+        with self._lock:
+            if cli in self.usage_held:
+                return self.usage_held[cli]
+        reason = self._read_codex() if cli == CODEX else self._read_claude()
+        if reason is not None and self.config.uses_codex():
+            with self._lock:
+                self.usage_held.setdefault(cli, reason)
+        return reason
+
+    def _read_claude(self):
         if self.config.settings.claude.auth == "api_key":
             return None
         try:
@@ -331,6 +355,37 @@ class Supervisor:
         except UsageError as e:
             return f"usage unknown, not starting: {e}"
         return over_limit(self.usage, self.config.settings.claude.limits)
+
+    def _read_codex(self):
+        try:
+            self.codex_usage = self.codex_reader()
+        except UsageError as e:
+            self._codex_readable(False, str(e))
+            return f"Codex usage unknown, not starting: {e}"
+        self._codex_readable(True)
+        return over_limit(self.codex_usage, self.config.codex_limits(), "Codex ")
+
+    def _codex_readable(self, readable, reason=""):
+        """Records each change between Codex's usage read and not read, so the user hears once of each time it
+        cannot be read, as for Claude."""
+        with self._codex_lock:
+            last = self.store.last_event("codex_usage_read")
+            if last is None or last["readable"] != readable:
+                self.store.record("codex_usage_read", readable=readable, reason=reason)
+
+    def _wait_for_usage(self, cli):
+        """Ends this turn when no run of `cli` may start. A stop or the cycle's end halts every run. A usage limit
+        holds only the runs of its own agent CLI: the task waits for a later cycle and the rest go on. With no
+        project on Codex every run is Claude's, so Claude's limit halts the cycle, as it always has."""
+        reason = self._stop_reason()
+        if reason is not None:
+            self._halt(reason)
+        reason = self._usage_limit(cli)
+        if reason is None:
+            return
+        if cli == CLAUDE and not self.config.uses_codex():
+            self._halt(reason)
+        raise CycleStop(reason)
 
     def _halt(self, reason):
         with self._lock:
@@ -340,15 +395,13 @@ class Supervisor:
     # The dashboard's snapshot.
 
     def _snapshot(self, supervisor, reason=None, next_wake=None):
-        usage = self.usage and {"session": self.usage.session, "week": self.usage.week,
-                                "session_resets": self.usage.session_resets, "week_resets": self.usage.week_resets}
         with self._lock:
             self.store.write_current({
-                "supervisor": supervisor, "last_reason": reason, "next_wake": next_wake, "usage": usage,
+                "supervisor": supervisor, "last_reason": reason, "next_wake": next_wake, "usage": _usage_view(self.usage),
                 "workers": list(self.workers.values()), "waiting_for_machine": self.waiting,
                 "unreachable_machines": self.unreachable,
                 "queen_run": self.queen_run,
-            })
+            } | ({"codex_usage": _usage_view(self.codex_usage)} if self.config.uses_codex() else {}))
 
     def _phase(self, task, phase):
         self.store.record("phase_changed", task=task.key, project=task.project.name, phase=phase)
@@ -415,9 +468,7 @@ class Supervisor:
 
     def _agent(self, task, role, cwd, prompt, tools, run_id, tokens=None, schema=None, resume=None, cli=CLAUDE):
         """Runs one agent for `task` with the agent CLI `cli`; Claude Code unless a caller names another."""
-        reason = self._gate()
-        if reason is not None:
-            self._halt(reason)
+        self._wait_for_usage(cli)
         if self._is_paused(task.project):
             raise CycleStop
         allowed, denied = tools
@@ -438,9 +489,7 @@ class Supervisor:
         if result.stopped:
             self._halt("stopped while an agent was running")
         if result.is_error:
-            reason = self._gate()  # A run cut off by a limit is not the task's fault.
-            if reason is not None:
-                self._halt(reason)
+            self._wait_for_usage(cli)  # A run cut off by a limit is not the task's fault.
             raise KanduTrouble(f"{role} run {run_id} ended with an error")
         return result
 
@@ -1970,10 +2019,15 @@ class Supervisor:
         self.next_wake = (woke + timedelta(minutes=settings.wake_every_minutes)).isoformat(timespec="seconds")
         self.halt_reason = None
         self.queen_trouble = None
+        self.usage_held.clear()
         failed = self.github.refresh(self.config)  # the copy as GitHub holds it now, before anything is decided
         if failed:
             self.store.record("copy_not_read", detail="; ".join(failed))
         reason = self._gate() or self._queen_limit()
+        if self.config.uses_codex():
+            codex = self._usage_limit(CODEX)  # read each cycle, so the dashboard shows it
+            if reason is not None and reason == self.usage_held.get(CLAUDE) and codex is None:
+                reason = None  # Codex's runs may start: Claude's limit holds Claude's runs alone
         if reason is None:
             try:
                 self._close_groups()
@@ -1984,6 +2038,8 @@ class Supervisor:
             except (GitHubError, RunnerError) as e:
                 self.queen_trouble = type(e).__name__
             reason = self._work_through_board()
+            if self.halt_reason is None and reason in ("nothing ready", "tasks ran out", "waiting for a machine"):
+                reason = self.usage_held.get(CLAUDE, reason)  # Claude's runs waited all along: it says so, as ever
         self._tell_open_flights()
         self._clean(clean_since)
         self._watch_machines()
@@ -2021,12 +2077,18 @@ class Supervisor:
 
     def dry_run(self):
         """Shows what a cycle would do. Starts no agent and writes nothing."""
+        self.usage_held.clear()
         reason = self._gate()
         if reason is not None:
             return [f"would sleep: {reason}"]
         tasks = self._board_tasks()
         return [f"{t.key} [{t.status}] on {t.project.machine}: reachable={self.runner.reachable(t.project.machine)}"
                 for t in tasks] or ["would sleep: nothing ready"]
+
+
+def _usage_view(usage):
+    return usage and {"session": usage.session, "week": usage.week,
+                      "session_resets": usage.session_resets, "week_resets": usage.week_resets}
 
 
 def _locked_cycle(supervisor):
