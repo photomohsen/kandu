@@ -18,7 +18,9 @@ from .queen import COULD_NOT_FINISH
 
 TIMEOUT_SECONDS = 10
 QUIET_SLEEPS = ("nothing ready", "tasks ran out", "waiting for a machine", "cycle time is up",
-                "stopped while an agent was running")  # The last two: the next cycle resumes the task.
+                "cycle time ran out while an agent was running",
+                "stopped while an agent was running")  # The last three: the next cycle resumes the task. The last
+# one is how a cycle that ran out of time ended before; the events of those days still hold it.
 BOARDS_UNREADABLE = "could not read the boards"
 QUEEN_TROUBLE = "the queen could not look"
 LIMIT_SLEEPS = ("5-hour usage", "weekly usage", "the queen reached her daily token limit")
@@ -347,7 +349,9 @@ class Notifier:
         if not self.buttons or message.text != "pr_ready":
             return None
         from .telegram_bot import approve_markup  # here, as telegram_bot reads this module's words
-        return approve_markup(message.values["task"], self.language)
+        task = message.values["task"]
+        reviewed = self.store.last_event("review_finished", task=task)  # the head the yes is asked for
+        return approve_markup(task, reviewed and reviewed.get("head_sha"), self.language)
 
     def tell(self, message):
         if message.kind not in self.events:

@@ -227,7 +227,7 @@ class FakeRunner:
         self.on_push = lambda: None
         self.heads_at_merge = {}
 
-    def merge_base(self, project, repo, directory, branch, base, message):
+    def merge_base(self, project, repo, directory, branch, base, message, kept=None):
         self.merged.append((directory, base))
         self.merge_message = message
         self.heads_at_merge[branch] = self.github.prs[(repo, 1)]["headRefOid"]
@@ -285,6 +285,8 @@ class FakeRunner:
         result = step() if callable(step) else step
         with self.lock:
             self.running -= 1
+        if should_stop():  # the real runner kills the run here, and what it made is lost
+            return AgentResult(stopped=True)
         return result if isinstance(result, AgentResult) else ok(result)
 
 
@@ -332,6 +334,9 @@ class Base(unittest.TestCase):
     def events(self, kind):
         day = datetime.now().astimezone().date().isoformat()
         return [e for e in self.store.events(day) if e["type"] == kind]
+
+    def decisions(self, kind):
+        return [e for e in self.events("decision") if e["decision"] == kind]
 
     def tried_before(self, issue=1):
         """Kandu's own trouble came back on this task until the next one is its last try."""
@@ -629,6 +634,118 @@ class PausedOnTheDashboardTest(Base):
         self.store.pause_project("website")
         self.assertFalse(self.sup._queen())
         self.assertEqual(self.runner.runs, [])
+
+
+class StopLetsBeesFinishTest(Base):
+    """Stop kills no run: each one at work finishes its step and keeps what it made, and nothing new starts."""
+
+    def stop_during(self, step):
+        def stopped_while_working():
+            self.store.request_stop()
+            return step() if callable(step) else step
+        return stopped_while_working
+
+    def test_a_worker_at_work_finishes_its_pr_is_opened_and_nothing_starts_after_it(self):
+        self.github.add(1)
+        self.runner.steps = [self.stop_during(self.worker_makes_pr())]
+        self.assertEqual(self.cycle(), "stopped by the user")
+        self.assertEqual(len(self.runner.runs), 1)
+        self.assertEqual(len(self.decisions("pr_opened")), 1)
+        self.assertEqual(self.events("review_finished"), [])
+        self.assertEqual(self.store.read_current()["supervisor"], "stopped")
+
+    def test_a_review_at_work_is_kept_and_no_merge_or_deploy_starts(self):
+        self.config.projects[0].auto_merge = True
+        self.github.add(1, "In review")
+        self.github.open_pr(REPO, 1, SHA1)
+        self.runner.steps = [self.stop_during(report(SHA1))]
+        self.assertEqual(self.cycle(), "stopped by the user")
+        self.assertEqual(len(self.events("review_finished")), 1)
+        self.assertEqual(self.github.merges, [])
+        self.assertEqual([c for c, secrets in self.runner.commands if secrets], [])
+        self.assertEqual(self.events("deployed"), [])
+
+    def test_a_stop_during_the_tests_stops_the_merge(self):
+        self.github.add(1)
+        task = read_tasks(self.config, self.github)[0]
+        self.sup._merge_waits = lambda *_: self.store.request_stop() or []
+        self.github.merge_pr = mock.Mock()
+        self.config.auto_merge_for = lambda project: True
+        self.assertFalse(self.sup._merge(task, self.github.open_pr(REPO, 1), "approved", True))
+        self.github.merge_pr.assert_not_called()
+
+    def test_no_task_waiting_its_turn_starts_after_the_stop(self):
+        self.github.add(1)
+        self.github.add(2)
+        self.config.projects[0].max_parallel_workers = 1
+        self.runner.steps = [self.stop_during(GAVE_UP)]
+        self.assertEqual(self.cycle(), "stopped by the user")
+        self.assertEqual(len(self.runner.runs), 1)
+        self.assertEqual(self.github.status(2), "Ready")
+
+    def test_a_resume_while_the_run_finishes_lets_the_cycle_go_on(self):
+        self.github.add(1)
+        self.github.add(2)
+        self.config.projects[0].max_parallel_workers = 1
+
+        def stopped_and_resumed():
+            self.store.request_stop()
+            self.store.stop_file.unlink()
+            return GAVE_UP
+        self.runner.steps = [stopped_and_resumed, GAVE_UP]
+        self.assertEqual(self.cycle(), "tasks ran out")
+        self.assertEqual(len(self.runner.runs), 2)
+        self.assertEqual(self.github.status(2), "Blocked")
+        self.assertEqual(self.store.read_current()["supervisor"], "asleep")
+
+    def test_no_cycle_starts_while_stopped_and_the_user_hears_once(self):
+        self.github.add(1)
+        self.store.request_stop()
+        self.github.refresh = mock.Mock(side_effect=AssertionError("a stopped Kandu reads nothing"))
+        self.assertEqual(self.cycle(), "stopped by the user")
+        self.assertEqual(self.cycle(), "stopped by the user")
+        self.assertEqual(self.runner.runs, [])
+        self.assertEqual(self.events("supervisor_woke"), [])
+        self.assertEqual([e["reason"] for e in self.events("supervisor_slept")], ["stopped by the user"])
+        self.assertEqual(self.store.read_current()["supervisor"], "stopped")
+
+    def test_the_cycles_time_limit_still_cuts_a_run_off(self):
+        self.github.add(1)
+
+        def runs_past_the_deadline():
+            self.clock[0] += timedelta(minutes=self.config.settings.supervisor.max_cycle_minutes + 1)
+            return self.worker_makes_pr()()
+        self.runner.steps = [runs_past_the_deadline]
+        self.assertEqual(self.cycle(), supervisor.CUT_OFF)
+        self.assertEqual(self.decisions("pr_opened"), [])
+
+    def test_stopping_one_bee_still_cuts_it_off_at_once(self):
+        self.github.add(1)
+
+        def its_own_stop():
+            self.store.request_worker_stop(self.sup.workers[KEY]["run_id"])
+            return self.worker_makes_pr()()
+        self.runner.steps = [its_own_stop]
+        self.cycle()
+        self.assertEqual(self.decisions("pr_opened"), [])
+        self.assertEqual(self.github.status(1), "Blocked")
+
+    def test_the_stop_command_and_the_status_say_the_same_as_the_button(self):
+        def run(*args):
+            out = io.StringIO()
+            with mock.patch("sys.argv", ["supervisor", *args]), mock.patch.object(supervisor, "StateStore",
+                                                                                 lambda: self.store), \
+                    contextlib.redirect_stdout(out):
+                supervisor.main()
+            return out.getvalue()
+        self.store.write_current({"supervisor": "awake", "workers": [{"task": KEY}, {"task": f"{REPO}#2"}],
+                                  "queen_run": None})
+        run("stop")
+        self.assertTrue(self.store.stop_file.exists())
+        self.assertEqual(json.loads(run("status"))["stopping"], 2)
+        run("resume")
+        self.assertFalse(self.store.stop_file.exists())
+        self.assertEqual(json.loads(run("status"))["stopping"], 0)
 
 
 class CopyNotReadTest(Base):
@@ -938,6 +1055,36 @@ class QueenTest(Base):
         self.runner.steps = [stop]
         self.cycle()
         self.assertEqual(len(self.runner.runs), 1)
+
+    def test_her_look_at_work_finishes_and_waits_for_the_resume_to_be_carried_out(self):
+        def stop():
+            self.store.request_stop()
+            return self.reply(self.retry())
+        self.runner.steps = [GAVE_UP, stop]
+        self.assertEqual(self.cycle(), "stopped by the user")
+        self.assertEqual(len(self.runner.runs), 2)
+        held = self.events("queen_held")
+        self.assertEqual([d["action"] for d in held[0]["decisions"]], ["retry"])
+        self.assertEqual(self.events("queen_decided"), [])
+        self.assertEqual(self.github.status(1), "Blocked")
+        self.cycle()  # still stopped: nothing is carried out
+        self.assertEqual(self.github.status(1), "Blocked")
+        self.store.stop_file.unlink()
+        self.runner.steps = [GAVE_UP, self.reply()]
+        self.cycle()
+        self.assertEqual([e["action"] for e in self.events("queen_decided")], ["retry"])
+        self.assertEqual(self.events("queen_finished")[0]["run_id"], held[0]["run_id"])
+        self.assertEqual(self.runner.runs[2].schema, agents.WORKER_SCHEMA)  # her held look is not paid for again
+
+    def test_a_resume_while_she_looks_carries_out_her_decisions_at_once(self):
+        def stop_and_resume():
+            self.store.request_stop()
+            self.store.stop_file.unlink()
+            return self.reply(self.retry())
+        self.runner.steps = [GAVE_UP, stop_and_resume, GAVE_UP, self.reply()]
+        self.cycle()
+        self.assertEqual(self.events("queen_held"), [])
+        self.assertEqual([e["action"] for e in self.events("queen_decided")], ["retry"])
 
     def test_a_bad_reply_changes_nothing_and_is_not_paid_for_again(self):
         self.runner.steps = [GAVE_UP, "still not json"]
@@ -1435,9 +1582,13 @@ class GateTest(Base):
 
     def test_cycle_deadline_stops_the_next_agent(self):
         def worker():
-            self.clock[0] = NOW + timedelta(minutes=51)
             self.github.open_pr(REPO, 1, SHA1)
             return PR_OPENED
+
+        def late(*args):
+            self.clock[0] = NOW + timedelta(minutes=51)  # the deadline passes between two runs
+            return "/review"
+        self.runner.prepare_review = late
         self.runner.steps = [worker]
         self.assertEqual(self.cycle(), "cycle time is up")
         self.assertEqual(len(self.runner.runs), 1)
@@ -1862,6 +2013,32 @@ class FirstRunTest(Base):
         self.assertEqual(len(self.github.opened), 1)
         self.assertEqual(self.github.status(1), "In review")
 
+    def test_a_pr_github_refuses_for_a_moment_opens_next_cycle_with_no_new_worker(self):
+        real = self.github.create_pr
+        self.github.create_pr = mock.Mock(side_effect=GitHubError("HTTP 502"))
+        self.runner.steps = [self.worker_makes_pr()]
+        self.cycle()
+        self.assertEqual(self.github.opened, [])
+        self.assertEqual(self.github.status(1), "In progress")
+        self.assertEqual(self.decisions("internal_error"), [])  # no try is spent
+        self.assertEqual(len(self.decisions("pr_open_waits")), 1)
+        self.github.create_pr = real
+        self.runner.steps = [report(SHA1)]  # only the review runs: the worker's reply was kept
+        self.cycle()
+        [(_, head, _, title, body)] = self.github.opened
+        self.assertEqual(head, "kandu/1-task-1")
+        self.assertIn("Closes #1", body)
+        self.assertEqual(len(self.decisions("pushed_reply_reused")), 1)
+        self.assertEqual(self.github.status(1), "In review")
+
+    def test_a_dropped_machine_never_uses_up_the_last_try(self):
+        self.tried_before()
+        self.runner.prepare_worktree = mock.Mock(side_effect=Unreachable("server did not answer over SSH"))
+        self.cycle()
+        self.assertEqual(self.github.status(1), "In progress")
+        self.assertEqual(self.events("task_finished"), [])
+        self.assertTrue(self.events("decision")[-1]["reason"].startswith("kandu.runner.Unreachable"))
+
     def test_a_pr_github_refuses_to_open_stops_the_task(self):
         self.runner.steps = [lambda: PR_OPENED]  # it says it pushed, but no branch is on GitHub
         self.cycle()
@@ -2065,7 +2242,7 @@ class FirstRunTest(Base):
 
     def test_a_run_stopped_midway_resumes_next_cycle(self):
         self.runner.steps = [AgentResult(stopped=True)]
-        self.assertEqual(self.cycle(), "stopped while an agent was running")
+        self.assertEqual(self.cycle(), supervisor.CUT_OFF)
         self.assertEqual(self.github.status(1), "In progress")
         self.runner.steps = [self.worker_makes_pr(), report(SHA1)]
         self.cycle()
@@ -3139,9 +3316,6 @@ class MergeRetryTest(Base):
         items = list(sup._board_items())
         events = queen.all_events(self.store)
         return next(p for p in sup._project_view(items, sup._startable(items), events) if p["project"] == "website")
-
-    def decisions(self, kind):
-        return [e for e in self.events("decision") if e["decision"] == kind]
 
     def test_a_merge_refused_twice_for_a_moment_lands_and_deploys_in_the_same_cycle(self):
         self.refuses(2)
