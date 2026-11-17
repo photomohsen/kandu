@@ -1473,9 +1473,6 @@ class Supervisor:
             if not self._reachable(project.machine):
                 self.store.record("check_skipped", project=project.name, machine=project.machine)
                 continue
-            if not self._reachable(project.machine):
-                self.store.record("check_skipped", project=project.name, machine=project.machine)
-                continue
             try:
                 problems = self._check_project(project)
             except Unreachable:
