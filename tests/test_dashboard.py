@@ -790,6 +790,19 @@ class ControlTest(Base):
         self.assertEqual((status, body), (200, {"opening": flights.ZANBOURDAR}))
         self.api.flights.open_zanbourdar.assert_called_once_with("fa")
 
+    def test_a_kanduban_opens_on_a_project_with_the_token_and_says_when_its_machine_does_not_answer(self):
+        self.api.flights = mock.Mock()
+        self.api.flights.open_kanduban.return_value = "k-1"
+        self.assertEqual(dispatch(self.api, "POST", "/api/v1/flights/kanduban/website?language=fa")[0], 403)
+        self.assertEqual(dispatch(self.api, "POST", "/api/v1/flights/kanduban/website?language=fa", TOKEN),
+                         (200, {"opening": "k-1"}))
+        project, language = self.api.flights.open_kanduban.call_args.args
+        self.assertEqual((project.name, language), ("website", "fa"))
+        self.assertEqual(dispatch(self.api, "POST", "/api/v1/flights/kanduban/nothing", TOKEN)[0], 404)
+        self.api.flights.open_kanduban.side_effect = flights.KandubanError("builder did not answer")
+        self.assertEqual(dispatch(self.api, "POST", "/api/v1/flights/kanduban/website", TOKEN),
+                         (503, {"error": "builder did not answer"}))
+
     def test_a_task_flight_opens_in_the_language_of_the_page(self):
         self.api.flights = mock.Mock()
         status, body = dashboard.dispatch(self.api, "POST", f"/api/v1/flights/tasks/{REPO}/7?language=fa", TOKEN)
@@ -1605,7 +1618,7 @@ const pick = items => items.map(i => i.label);
 console.log(JSON.stringify({{phone: pick(moreItems([], false)), wide: pick(moreItems([], true)),
   phoneOpen: moreItems({json.dumps(open_)}, false), wideOpen: pick(moreItems({json.dumps(open_)}, true))}}));""")
         self.assertEqual(menus["phone"], ["Wake the queen", "Read the board", "Restart Kandu", "Open Didban", "Open Zanbourdar",
-                                          "Bazras", "Daily usage", "Live stream", "Look", "فارسی"])
+                                          "Bazras", "Daily usage", "Live stream", "Calm", "Look", "فارسی"])
         self.assertEqual(menus["wide"], ["Read the board", "Restart Kandu", "Open Zanbourdar", "Bazras", "Daily usage",
                                          "Live stream", "Look", "فارسی"])
         self.assertEqual(menus["wideOpen"], ["Read the board", "Restart Kandu", "Close Didban", "Go to Zanbourdar",
