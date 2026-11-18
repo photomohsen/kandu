@@ -9,6 +9,7 @@ One word for each concept. Use these words in code, docs, prompts and issues. A 
 | **Queen** | The one LLM that runs the cycle for all projects: she releases tasks from `Backlog` and judges what stopped; code checks each decision, and she cannot merge |
 | **Worker** | An agent that does one task in its own `git worktree` |
 | **Technical debt** | The column for tasks the user parked without refining them; no agent reads it, and Didban brings them up |
+| **Multi-user project** | A project whose board several people share, each with a Kandu of their own (`multi_user`); an install works only the tasks assigned to its own GitHub account |
 | **Splitter** | A read-only agent that sizes every task in `Backlog` against the scale and proposes how to split a `Large` one |
 | **Queen answers one-way merges** | A project's switch, off by default: on, the queen's yes to a merge answers its one-way door and the review's questions for the user; off, those wait for the user's yes |
 | **Split approval** | Who accepts a project's split proposals, the user or the queen; the user by default, set in the registry or the dashboard's settings section |
@@ -19,6 +20,7 @@ One word for each concept. Use these words in code, docs, prompts and issues. A 
 | **Didban** | The control role, run from the machine the user sits at |
 | **Free flight** | A session the user opens on a task from the dashboard, with full access; Kandu's agents keep running beside it |
 | **Zanbourdar** | Persian for "beekeeper": a session the user opens beside Didban from the dashboard, with full access and tied to no task; it may change Kandu itself |
+| **Handoff** | A job Didban hands to Zanbourdar on the user's yes, typed into Zanbourdar's session by `kandu.handoff`, and the short report Zanbourdar sends back to Didban |
 | **Brief** | One short private file per project, `local/brief/<project>.md`, that Didban reads when the user names the project; it changes only through `kandu.brief` |
 | **Repo note** | `KANDU.md` in a project's repo, rendered by `kandu.note`: it says Kandu changes the repo, where its tasks are and how a breakage goes back to Kandu |
 | **Report file** | A file of the project's own, listed under `reports` in the registry, that Didban reads with the brief and never changes |
