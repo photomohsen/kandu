@@ -18,7 +18,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from . import (add, backup, bazras, clean, flights, ghlimit, ghmeter, queen, questions, remove, rename, review, sessions, split,
-               tasks, timer, tries, upstream, waits)
+               tasks, timer, tries, upstream, version, waits)
 from .config import (AGENT_CLIS, CLAUDE, CODEX, DEFAULT_LOCAL_DIR, NOTIFY_EVENTS, PACE_SETTINGS, REGISTRY_SETTINGS, TECHNICAL_DEBT,
                      ConfigError, Inspect, UsageLimits,
                      load_config, set_backup, set_clean_merged, set_drop_blockers, set_inspect, set_limits, set_pace,
@@ -401,6 +401,7 @@ class Api:
             "clean_merged": self.config.settings.supervisor.clean_merged,
             "upstream": self._upstream(),
             "github_refused": self._github_refused(),
+            "version": version.read(),
         }
 
     def _github_refused(self):

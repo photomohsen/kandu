@@ -18,7 +18,7 @@ from kandu import agents, notify, queen, questions, review, split, supervisor, t
 from kandu.config import Rules, UsageLimits, load_config
 from kandu.flights import Flights, task_key
 from kandu.notify import Notifier
-from kandu.github import BoardItem, GitHubError
+from kandu.github import BoardItem, GitHubError, is_breaking
 from kandu.runner import AgentResult, LocalWork, RunnerError, Unreachable
 from kandu.state import StateStore
 from kandu.supervisor import CycleStop, Supervisor, read_tasks
@@ -95,7 +95,7 @@ class FakeGitHub:
         return {"kind": "issue", "repo": repo, "number": number, "title": issue.title, "state": "OPEN",
                 "labels": [{"name": n} for n in issue.labels], "url": issue.url, "body": issue.body, "comments": []}
 
-    def create_issue(self, repo, title, body, by_hand=False, tokens=False, assignee=""):
+    def create_issue(self, repo, title, body, by_hand=False, tokens=False, assignee="", breaking=False):
         self.created.append((repo, title, body))
         return f"https://github.com/{repo}/issues/{900 + len(self.created)}"
 
@@ -189,7 +189,12 @@ class FakeGitHub:
         return None  # GitHub removed it on merge
 
     def mark_pr(self, repo, pr):
-        pr["labels"] = [{"name": "kandu"}]
+        if {"name": "kandu"} not in pr["labels"]:
+            pr["labels"].append({"name": "kandu"})
+
+    def mark_breaking(self, repo, pr):
+        if {"name": "breaking"} not in pr["labels"]:
+            pr["labels"].append({"name": "breaking"})
 
     def companions(self, repo, pr, repos):
         return []
@@ -258,7 +263,7 @@ class FakeRunner:
     def reachable(self, machine):
         return machine not in self.down
 
-    def prepare_worktree(self, project, repo, branch, base, cleaned=None):
+    def prepare_worktree(self, project, repo, branch, base, cleaned=None, settled=None):
         return "/worktree"
 
     def prepare_review(self, project, repo, branch, head):
@@ -2333,7 +2338,7 @@ class FirstRunTest(Base):
         self.assertEqual(self.github.status(1), "Blocked")
 
     def test_a_cleaned_worktree_is_recorded_once(self):
-        def prepare(project, repo, branch, base, cleaned=None):
+        def prepare(project, repo, branch, base, cleaned=None, settled=None):
             cleaned("cancelled a merge an earlier run left unfinished in the task's folder")
             return "/worktree"
         self.runner.prepare_worktree = prepare
@@ -2342,6 +2347,17 @@ class FirstRunTest(Base):
         cleanups = [e for e in self.events("decision") if e["decision"] == "worktree_cleaned"]
         self.assertEqual(len(cleanups), 1)
         self.assertIn("merge", cleanups[0]["reason"])
+        self.assertEqual(self.github.status(1), "In review")
+
+    def test_a_drifted_branch_settled_on_pickup_is_logged_and_the_task_goes_on(self):
+        def prepare(project, repo, branch, base, cleaned=None, settled=None):
+            settled("Kandu merged GitHub's head abc into the folder's def")
+            return "/worktree"
+        self.runner.prepare_worktree = prepare
+        self.runner.steps = [self.worker_makes_pr(), report(SHA1)]
+        self.cycle()
+        settles = [e for e in self.events("decision") if e["decision"] == "worktree_settled"]
+        self.assertEqual([e["reason"] for e in settles], ["Kandu merged GitHub's head abc into the folder's def"])
         self.assertEqual(self.github.status(1), "In review")
 
     def test_unpushed_work_in_the_folder_stops_the_task_with_a_plain_message(self):
@@ -2630,6 +2646,20 @@ class ReviewRoundsTest(Base):
         self.assertEqual(self.github.prs[(REPO, 1)]["labels"], [{"name": "kandu"}])
         event = self.events("review_finished")[0]
         self.assertEqual((event["round"], event["head_sha"], event["findings"]), (1, SHA1, 0))
+
+    def test_a_pr_from_a_breaking_task_carries_the_mark(self):
+        self.github.items = []
+        self.github.add(1, labels=("agent", "breaking"))
+        self.runner.steps = [self.worker_makes_pr(), report(SHA1)]
+        self.cycle()
+        self.assertTrue(read_tasks(self.config, self.github)[0].breaking)
+        self.assertTrue(is_breaking(self.github.prs[(REPO, 1)]))
+
+    def test_a_pr_from_a_task_without_the_mark_is_not_breaking(self):
+        self.runner.steps = [self.worker_makes_pr(), report(SHA1)]
+        self.cycle()
+        self.assertFalse(read_tasks(self.config, self.github)[0].breaking)
+        self.assertFalse(is_breaking(self.github.prs[(REPO, 1)]))
 
     def test_a_pr_left_to_the_user_records_what_holds_it(self):
         def review_with_failing_ci():
