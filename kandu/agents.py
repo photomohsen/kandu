@@ -21,7 +21,9 @@ WORKER_STATUSES = ("pushed", "needs_info", "blocked")
 # A PR description that names its issue this way closes it on merge.
 CLOSES = re.compile(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?) #(\d+)\b", re.IGNORECASE)
 # Kandu merges the base, opens a PR and edits its description in code; no worker does, whatever the config says.
-KANDU_ONLY = ["Bash(git merge *)", "Bash(git pull *)", "Bash(git rebase *)", "Bash(gh pr create *)",
+# `git -C <dir> merge` is the same merge: Claude Code matches a rule's words from the start of the command.
+KANDU_ONLY = ["Bash(git merge *)", "Bash(git pull *)", "Bash(git rebase *)", "Bash(git -C * merge *)",
+              "Bash(git -C * pull *)", "Bash(git -C * rebase *)", "Bash(gh pr create *)",
               "Bash(gh pr edit *)", "Bash(gh pr merge *)"]
 LIVE_RESULTS = ("pass", "fail")
 QUEEN_ACTIONS = ("release", "retry", "rework", "verify", "new_task", "block_on", "approve", "ask_user", "park",

@@ -188,17 +188,26 @@ def _event(line):
     return event if isinstance(event, dict) else None
 
 
+# A `claude -p` run ends when its turn does, and with it every job it left running: a tool that waits for a later
+# turn would kill a test still going. So no run gets one, whatever its rules allow.
+LATER_TURN_TOOLS = ["ScheduleWakeup", "CronCreate", "Monitor"]
+# Claude Code holds one shell command to 10 minutes; a project's tests may take longer, and the run must wait for them
+# in the same turn. The cycle's deadline still ends a run that outlasts it.
+LONGEST_COMMAND_MS = 60 * 60 * 1000
+CLAUDE_RUN_SETTINGS = json.dumps({"env": {"BASH_MAX_TIMEOUT_MS": str(LONGEST_COMMAND_MS)}})
+
+
 def _claude_command(allowed, denied, model, schema, resume):
     # With no allow list the run may do everything; the deny list still holds.
     mode = ["--permission-mode", "bypassPermissions"] if allowed is None else \
         ["--permission-mode", "dontAsk", "--allowedTools", *allowed]
     return ["claude", "-p", "--output-format", "stream-json", "--verbose", *mode,
             # A repo's own settings must not change what this run may do.
-            "--setting-sources", "user",
+            "--setting-sources", "user", "--settings", CLAUDE_RUN_SETTINGS,
             *(["--model", model] if model else []),
             *(["--resume", resume] if resume else []),
             *(["--json-schema", json.dumps(schema)] if schema else []),
-            *(["--disallowedTools", *denied] if denied else [])]
+            "--disallowedTools", *(denied or []), *LATER_TURN_TOOLS]
 
 
 class _ClaudeReply:

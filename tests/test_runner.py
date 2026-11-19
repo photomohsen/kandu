@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from kandu import agents, ghmeter, review
+from kandu import runner as runner_module
 from kandu.config import Config, Machine, Project, Rules, Setup
 from kandu.runner import (KEPT_CHECKED_OUT, KEPT_NOT_WORKTREE, KEPT_UNCOMMITTED, KEPT_UNPUSHED, REMOVED, Host, LocalWork, Runner,
                           RunnerError, SCOPE_PROBE, Unreachable, child_env, repo_path)
@@ -613,7 +614,19 @@ class RunnerTest(GitCase):
         self.assertEqual(args[args.index("--permission-mode") + 1], "bypassPermissions")
         self.assertEqual(args[args.index("--setting-sources") + 1], "user")
         self.assertNotIn("--allowedTools", args)
-        self.assertNotIn("--disallowedTools", args)
+        self.assertEqual(args[args.index("--disallowedTools") + 1:], runner_module.LATER_TURN_TOOLS)
+
+    def test_a_run_waits_for_a_long_command_in_its_own_turn(self):
+        # A test longer than Claude Code's own 10 minutes runs in the foreground, and nothing ends the turn
+        # to wait for it: that would end the run, and the test with it.
+        self.runner.run_agent("box", str(self.home), "p", None, ["Edit"], "r-1", lambda: False)
+        args = (self.home / "claude.args").read_text().splitlines()
+        settings = json.loads(args[args.index("--settings") + 1])
+        self.assertGreaterEqual(int(settings["env"]["BASH_MAX_TIMEOUT_MS"]), 30 * 60 * 1000)
+        denied = args[args.index("--disallowedTools") + 1:]
+        self.assertEqual(denied[0], "Edit")
+        for tool in ("ScheduleWakeup", "CronCreate", "Monitor"):
+            self.assertIn(tool, denied)
 
     def test_a_large_prompt_does_not_hang(self):
         prompt = "x" * 1_000_000
@@ -966,8 +979,10 @@ class ClaudeCommandTest(GitCase):
                               "m-1", schema={"type": "object"}, resume="s-1")
         self.assertEqual((self.home / "claude.args").read_text().splitlines(),
                          ["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "dontAsk",
-                          "--allowedTools", "Read", "Bash(npm test *)", "--setting-sources", "user", "--model", "m-1",
-                          "--resume", "s-1", "--json-schema", '{"type": "object"}', "--disallowedTools", "Edit"])
+                          "--allowedTools", "Read", "Bash(npm test *)", "--setting-sources", "user",
+                          "--settings", runner_module.CLAUDE_RUN_SETTINGS, "--model", "m-1",
+                          "--resume", "s-1", "--json-schema", '{"type": "object"}', "--disallowedTools", "Edit",
+                          *runner_module.LATER_TURN_TOOLS])
         self.assertFalse((self.home / "codex.args").exists())
 
 
@@ -1249,6 +1264,7 @@ class CodexTest(GitCase):
     def test_a_codex_run_cannot_run_what_kandu_alone_runs(self):
         install(self.home / ".local" / "bin" / "gh", "#!/bin/sh\necho \"gh ran: $*\"\n")
         for command in ("git merge main", "git pull", "git rebase main", "git pull --rebase origin main",
+                        "git -C . merge main", "git -C . pull", "git -C . rebase main",
                         "gh pr create --fill", "gh pr edit 7 --body x", "gh pr merge 7"):
             out = self.run_held(command)
             self.assertIn("denied", out, command)
