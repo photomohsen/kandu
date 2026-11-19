@@ -29,6 +29,8 @@ USAGE_UNKNOWN = "usage unknown"
 CHECK_NOT_RUN = "the check could not run"
 TESTS_FAIL_IN = "tests fail in "
 LIVE_DOWN = "the live URL does not answer"
+# Why a split proposal waits, on a project whose split approval is the queen's: with the queen on, she decides first.
+QUEEN_MAY_ACCEPT = "the queen may accept it, or leave it for the user"
 FAILED_OUTCOMES = {"failed": "task_failed", "deploy_failed": "deploy_failed",
                    "live_check_failed": "live_check_failed", "sizing_failed": "sizing_failed"}
 STUCK_OUTCOMES = {"blocked": "blocked", "needs_info": "needs_info", "pr_closed": "pr_closed",
@@ -249,6 +251,8 @@ def message_for(event, queen=False):
         return Message("needs_decision", "flight_left_open", f"flight_left_open:{event['task']}:{event['session']}",
                        values={"task": event["task"]})
     if kind == "decision" and event["decision"] == "split_waits":
+        if queen and event["reason"] == QUEEN_MAY_ACCEPT:  # her `ask_user` tells the user if she leaves it
+            return None
         return _task_message("needs_decision", "split", event, waits.yes())
     if kind == "decision" and event["decision"] == "split_approved":
         return _task_message("task_done", "split_made", event)

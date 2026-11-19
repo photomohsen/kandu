@@ -26,7 +26,7 @@ from .config import DEFAULT_LOCAL_DIR, TECHNICAL_DEBT, ConfigError, load_config
 from .flights import Flights
 from .github import TOKENS_LABEL, GitHubError, blockers_in, branch_for, task_blockers, transient
 from .mirror import open_github
-from .notify import CHECK_NOT_RUN, LIVE_DOWN, TESTS_FAIL_IN, notifier_for
+from .notify import CHECK_NOT_RUN, LIVE_DOWN, QUEEN_MAY_ACCEPT, TESTS_FAIL_IN, notifier_for
 from .runner import AGENT_CLIS, CLAUDE, CODEX, DEFAULT_LOGS_DIR, LocalWork, Runner, RunnerError, Unreachable
 from .state import StateStore
 from .tasks import TaskError
@@ -1452,8 +1452,7 @@ class Supervisor:
         """Every proposal waits in `Needs split`, also when every slice is two-way: for the user's yes, and on a
         project whose split approval is the queen's, also for hers."""
         approval = self.store.project_setting(task.project, "split_approval")
-        why = "the user accepts this project's splits" if approval == "user" \
-            else "the queen may accept it, or leave it for the user"
+        why = "the user accepts this project's splits" if approval == "user" else QUEEN_MAY_ACCEPT
         self._decide(task, "split_waits", why)
         self.github.comment_issue(task.repo, task.number, f"Kandu sized this {sizing.LARGE}. "
                                   "A proposal to split it waits for the owner.")
