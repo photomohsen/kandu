@@ -41,6 +41,10 @@ input, select { font:400 14px/1.4 var(--sans); min-height:36px; padding:6px 12px
 .brand { display:flex; align-items:center; gap:9px; font-size:18px; font-weight:700; }
 .brand::before { content:""; width:20px; height:18px; background:var(--honey); clip-path:polygon(25% 0,75% 0,100% 50%,75% 100%,25% 100%,0 50%); }
 .pulse { display:inline-flex; align-items:center; gap:7px; min-width:0; font-size:13px; color:var(--muted); }
+.version { min-width:0; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; font-weight:600; color:var(--muted); background:var(--sunken); border:1px solid var(--line); border-radius:999px; padding:2px 9px; text-decoration:none; }
+.version.latest { color:var(--good); }
+.version.newer { color:var(--accent); border-color:var(--honey); }
+a.version[href]:hover { text-decoration:underline; }
 .pulse i { width:8px; height:8px; border-radius:50%; background:var(--muted); flex:none; }
 .pulse.awake i { background:var(--good); box-shadow:0 0 0 3px color-mix(in srgb, var(--good) 22%, transparent); }
 .pulse.stopped i, .pulse.refused i { background:var(--bad); }
@@ -331,6 +335,8 @@ dialog.sheet[open] { display:flex; flex-direction:column; }
 .set-danger h3 { margin:0; font-size:13px; font-weight:700; color:var(--bad); }
 .set-danger p { margin:0; font-size:13px; overflow-wrap:anywhere; }
 .name-field { width:100%; }
+.model-row { display:flex; gap:8px; align-items:center; min-width:0; }
+.model-row .name-field { flex:1; min-width:0; }
 .patch-name.clickable:hover { text-decoration:underline; }
 @media (max-width: 640px) {
   dialog.menu, [dir="rtl"] dialog.menu { width:100%; max-width:100%; margin:auto 0 0; border-radius:20px 20px 0 0; padding:8px 8px calc(14px + env(safe-area-inset-bottom)); }
@@ -356,6 +362,7 @@ dialog.sheet[open] { display:flex; flex-direction:column; }
 <header class="top">
   <div class="bar">
     <span class="brand" data-t="brand"></span>
+    <a id="version" class="version" hidden></a>
     <span id="pulse" class="pulse"><i></i><span id="state" dir="auto" data-t="loading"></span></span>
     <span class="spacer"></span>
     <button id="stop" class="btn danger" data-t="stop"></button>
@@ -412,6 +419,10 @@ dialog.sheet[open] { display:flex; flex-direction:column; }
 <dialog id="modal"><div class="dialog-head"><h2 id="modaltitle"></h2><button class="btn plain small" data-close data-t-attr="aria-label" data-t="close">×</button></div><div id="modalbody" class="dialog-body"></div></dialog>
 <dialog id="sheet" class="sheet" data-t-attr="aria-label" data-t="task_sheet"><div id="sheetbody" class="sheet-body"></div><div id="sheetfoot" class="sheet-foot"></div></dialog>
 <dialog id="setsheet" class="sheet" data-t-attr="aria-label" data-t="tab_settings"><div id="setbody" class="sheet-body"></div><div id="setfoot" class="sheet-foot"></div></dialog>
+<dialog id="releasebox" class="small"><form method="dialog" class="dialog-body">
+  <h2 id="releasehead"></h2><p id="releasewhy" class="muted" data-t="release_why"></p><pre id="releasetext" class="log" dir="ltr"></pre>
+  <div class="actions confirm-actions"><button class="btn" value="no" data-t="close"></button><button type="button" id="releasenow" class="btn primary" data-t="release_open"></button></div>
+</form></dialog>
 <dialog id="tokenbox" class="small"><form method="dialog" class="dialog-body" id="tokenform">
   <h2 data-t="control_token"></h2><p class="muted" data-t="token_why"></p>
   <input id="token" type="password" autocomplete="off" dir="ltr" data-t-attr="aria-label" data-t="control_token">
@@ -482,6 +493,12 @@ dialog.sheet[open] { display:flex; flex-direction:column; }
 {
  "en": {
   "brand": "Kandu",
+  "version_latest": "{v} · latest",
+  "version_newer": "{v} · {latest} is out",
+  "version_unknown": "{v} · latest not known, {tried}",
+  "version_tried": "last tried {at}",
+  "version_never_tried": "never tried",
+  "version_no_version": "no version",
   "hive": "The hive",
   "empty_meadow": "The meadow is empty: no task is on a board yet.",
   "bee_worker": "Worker bee",
@@ -757,6 +774,13 @@ dialog.sheet[open] { display:flex; flex-direction:column; }
   "upstream_task_open": "Open task",
   "upstream_task_made": "A task brings the updates in: it waits on the board",
   "upstream_task_there": "A task for the updates is already open",
+  "release_version": "Version",
+  "release_cut": "Cut a release",
+  "release_ask": "Release {to}? Kandu is at {from} now",
+  "release_why": "This is only the proposal: nothing has changed. Opening the release PR is the yes; it changes only VERSION and CHANGELOG.md through that PR, and nothing is tagged or published.",
+  "release_none": "No change since the last release",
+  "release_open": "Open the release PR",
+  "release_opened": "The release PR for {v} is open: it waits for your merge",
   "limits_title": "Usage limits",
   "parallel_title": "Workers at once",
   "parallel_why": "How many workers build at the same time. A review or a sizing takes no worker's place. The next cycle uses these.",
@@ -799,6 +823,17 @@ dialog.sheet[open] { display:flex; flex-direction:column; }
   "set_group_work": "Work",
   "set_group_merge": "Merge",
   "set_group_queen": "The queen",
+  "set_group_models": "Models",
+  "set_model_own": "Its own model",
+  "set_model_global": "global",
+  "set_model_from_global": "Same as global",
+  "set_model_same": "Same as global",
+  "set_model_default": "Claude's default",
+  "set_model_worker": "Worker",
+  "set_model_reviewer": "Reviewer",
+  "set_model_splitter": "Splitter",
+  "set_model_live_check": "Live check",
+  "set_model_bazras": "Bazras",
   "set_name": "Name",
   "set_name_hint": "Lowercase letters, digits and dashes. Kandu then knows it only by this name; its folder, repo and board stay as they are.",
   "set_run_label": "Bees work on it",
@@ -961,6 +996,12 @@ dialog.sheet[open] { display:flex; flex-direction:column; }
  },
  "fa": {
   "brand": "کندو",
+  "version_latest": "{v} · آخرین نسخه",
+  "version_newer": "{v} · نسخهٔ {latest} آمده",
+  "version_unknown": "{v} · آخرین نسخه معلوم نیست، {tried}",
+  "version_tried": "آخرین تلاش {at}",
+  "version_never_tried": "هنوز تلاش نشده",
+  "version_no_version": "بی‌نسخه",
   "hive": "کندو",
   "empty_meadow": "مرغزار خالی است: هنوز تسکی روی هیچ بوردی نیست.",
   "bee_worker": "زنبور کارگر",
@@ -1236,6 +1277,13 @@ dialog.sheet[open] { display:flex; flex-direction:column; }
   "upstream_task_open": "تسک باز",
   "upstream_task_made": "یک تسک به‌روزرسانی‌ها را می‌آورد: روی برد منتظر است",
   "upstream_task_there": "تسکی برای به‌روزرسانی‌ها از قبل باز است",
+  "release_version": "نسخه",
+  "release_cut": "انتشار نسخهٔ تازه",
+  "release_ask": "نسخهٔ {to} منتشر شود؟ کندو الان {from} است",
+  "release_why": "این فقط پیشنهاد است: چیزی تغییر نکرده. باز کردن PR انتشار یعنی بله؛ فقط VERSION و CHANGELOG.md را از راه همان PR تغییر می‌دهد و چیزی تگ یا منتشر نمی‌شود.",
+  "release_none": "از آخرین انتشار تغییری نیامده",
+  "release_open": "باز کردن PR انتشار",
+  "release_opened": "PR انتشار {v} باز شد: منتظر ادغام توست",
   "limits_title": "سقف مصرف",
   "parallel_title": "کارگرهای هم‌زمان",
   "parallel_why": "چند کارگر هم‌زمان کار بسازند. بازبینی و اندازه‌گیری جای کارگر را نمی‌گیرند. چرخهٔ بعدی از این عددها استفاده می‌کند.",
@@ -1278,6 +1326,17 @@ dialog.sheet[open] { display:flex; flex-direction:column; }
   "set_group_work": "کار",
   "set_group_merge": "ادغام",
   "set_group_queen": "ملکه",
+  "set_group_models": "مدل‌ها",
+  "set_model_own": "مدل خود این پروژه",
+  "set_model_global": "سراسری",
+  "set_model_from_global": "همان سراسری",
+  "set_model_same": "همان سراسری",
+  "set_model_default": "پیش‌فرض Claude",
+  "set_model_worker": "کارگر",
+  "set_model_reviewer": "بازبین",
+  "set_model_splitter": "اندازه‌گیر",
+  "set_model_live_check": "بررسی زنده",
+  "set_model_bazras": "بازرس",
   "set_name": "نام",
   "set_name_hint": "حروف کوچک انگلیسی، رقم و خط تیره. کندو بعد از آن پروژه را فقط با این نام می‌شناسد؛ پوشه، مخزن و برد آن همان می‌مانند.",
   "set_run_label": "زنبورها رویش کار می‌کنند",
@@ -1649,8 +1708,13 @@ dialog.sheet[open] { display:flex; flex-direction:column; }
   "backup_changed": "تنظیم پشتیبان تغییر کرد",
   "upstream_checked": "فاصله با مخزن اصلی بررسی شد",
   "upstream_check_failed": "فاصله با مخزن اصلی بررسی نشد",
+  "release_read": "تازه‌ترین نسخهٔ مخزن اصلی خوانده شد",
+  "release_read_failed": "تازه‌ترین نسخهٔ مخزن اصلی خوانده نشد",
   "upstream_task_created": "تسک آوردن به‌روزرسانی‌ها ساخته شد",
   "the upstream check is off: turn it on in kandu.yaml": "بررسی مخزن اصلی خاموش است: در kandu.yaml روشنش کن",
+  "no change since the last release: there is nothing to release": "از آخرین انتشار تغییری نیامده: چیزی برای انتشار نیست",
+  "the proposal changed since it was shown: look at it again": "پیشنهاد از وقتی نشان داده شد عوض شده: دوباره نگاهش کن",
+  "the release command printed no proposal": "فرمان انتشار پیشنهادی نداد",
   "main lacks no upstream commit at the last good check: check again first": "در آخرین بررسی موفق، main کامیتی از مخزن اصلی کم نداشت: اول دوباره بررسی کن",
   "bazras": "بازرس",
   "group_closed": "گروه بسته شد",
@@ -1901,6 +1965,35 @@ async function busy(button, work, text = t("working")) {
     button.classList.remove("busy");
     if (!drawn) button.innerHTML = label;
   }
+}
+
+// «Cut a release» (DESIGN §12): the action only reads the proposal, which `python -m kandu.release` prints with no
+// yes and changes nothing. The dialog shows it and asks; only its confirm, the user's yes, opens the release PR, and
+// only for the proposal shown. With no change since the last release it says so and offers no confirm.
+async function showRelease() {
+  const r = await fetch("/api/v1/release").catch(() => null);
+  const p = r ? await r.json().catch(() => ({})) : {};
+  if (!r?.ok) { toast(tr(p.error) || t("request_failed")); return; }
+  drawRelease(p);
+  if (!$("releasebox").open) $("releasebox").showModal();
+}
+
+function drawRelease(p) {
+  $("releasehead").textContent = p.next ? t("release_ask").replace("{to}", p.next).replace("{from}", p.version) : t("release_none");
+  $("releasewhy").hidden = !p.next;
+  $("releasetext").textContent = p.text || "";
+  $("releasenow").hidden = !p.next;
+  $("releasenow").dataset.proposal = p.next ? p.proposal : "";
+}
+
+async function cutRelease(button) {
+  const answer = await act(button, "/release?proposal=" + encodeURIComponent(button.dataset.proposal));
+  if (answer) {
+    $("releasehead").textContent = t("release_opened").replace("{v}", answer.version);
+    $("releasewhy").hidden = true;
+    $("releasetext").innerHTML = answer.url ? `<a href="${esc(answer.url)}" target="_blank" rel="noopener">${esc(answer.url)} ↗</a>` : "";
+    $("releasenow").hidden = true;
+  } else if (post.failed && "next" in post.failed) drawRelease(post.failed);  // it changed: the new proposal, to look at again
 }
 
 async function act(button, path, text) {
@@ -2315,7 +2408,7 @@ function renderStats(s) {
   const wake = `<div class="card stat"><div class="stat-label">${t("next_wake")}</div><div class="stat-value stat-small">${wakeText(s)}</div></div>`;
   const parked = debtCount();
   const debt = `<div class="card stat"><div class="stat-label">${t("debt")}</div><div class="stat-value${lastQueue ? "" : " muted"}">${lastQueue ? num(parked) : "—"}</div></div>`;
-  $("stats").innerHTML = meter(t("session"), s.usage?.session, s.limits.session) + meter(t("week"), s.usage?.week, s.limits.week) + codexMeters(s) + bees + yours + debt + wake + backupCard(s.backup) + upstreamCard(s.upstream) + dropCard(s.drop_blockers) + requestsCard(s.show_requests);
+  $("stats").innerHTML = meter(t("session"), s.usage?.session, s.limits.session) + meter(t("week"), s.usage?.week, s.limits.week) + codexMeters(s) + bees + yours + debt + wake + backupCard(s.backup) + upstreamCard(s.upstream) + dropCard(s.drop_blockers) + requestsCard(s.show_requests) + releaseCard(s.version);
 }
 
 // Codex's two usage tiles beside Claude's, only while a project uses Codex.
@@ -2323,6 +2416,12 @@ function codexMeters(s) {
   if (!s.codex) return "";
   const usage = s.codex.usage || {}, limits = s.codex.limits;
   return meter(t("codex_session"), usage.session, limits.session, "codex") + meter(t("codex_week"), usage.week, limits.week, "codex");
+}
+
+// Kandu's version, and «Cut a release», which shows the proposal first.
+function releaseCard(v) {
+  return `<div class="card stat"><div class="stat-label">${t("release_version")}</div><div class="stat-value stat-small"><bdi dir="ltr">${esc(v || "—")}</bdi></div>
+    <small><button class="textlink limit-edit" data-release>${t("release_cut")}</button></small></div>`;
 }
 
 // Whether open requests show with their decision maps: off until the user turns it on here.
@@ -2445,11 +2544,35 @@ function stopWord(s) {
   return s.stopping ? t(s.stopping === 1 ? "stopping_one" : "stopping_many").replace("{n}", num(s.stopping)) : tr("stopped");
 }
 
+// The header's version badge, from Kandu's own log: the install's version, and whether it is the newest release of
+// the public upstream. Behind, a click opens that release's changes. The page never asks GitHub.
+function renderVersion(v) {
+  const box = $("version");
+  if (!v) { box.hidden = true; return; }
+  const mine = v.installed || t("version_no_version");
+  const tried = v.tried_at ? t("version_tried").replace("{at}", when(v.tried_at)) : t("version_never_tried");
+  const said = v.up_to_date === true ? t("version_latest").replace("{v}", mine)
+    : v.up_to_date === false ? t("version_newer").replace("{v}", mine).replace("{latest}", v.latest)
+    : t("version_unknown").replace("{v}", mine).replace("{tried}", tried);
+  box.textContent = said;
+  box.title = said;
+  box.className = `version ${v.up_to_date === true ? "latest" : v.up_to_date === false ? "newer" : "unknown"}`;
+  if (v.up_to_date === false && v.url) {
+    box.href = v.url;
+    box.target = "_blank";
+    box.rel = "noopener";
+  } else {
+    box.removeAttribute("href");
+  }
+  box.hidden = false;
+}
+
 async function refreshState() {
   stateReadAt = Date.now();
   const s = await get("/state");
   lastState = s;
   if (!saved(LANGUAGE_KEY) && TEXT[s.language] && s.language !== lang) setLanguage(s.language);  // The browser's choice wins.
+  renderVersion(s.version_badge);
   const name = s.stop_requested ? "stopped" : (s.supervisor || "never ran");
   const refused = githubRefused(s);
   $("pulse").className = `pulse ${s.stop_requested ? "stopped" : refused ? "refused" : s.supervisor === "awake" ? "awake" : ""}`;
@@ -2671,7 +2794,9 @@ function renderSettings(s) {
 
 // A project's pop-up shows every setting it has, in its groups. Nothing changes until Save, and then each change
 // goes through the call it always had, so it is checked and logged as before.
-const SETTING_GROUPS = [["set_group_work", ["paused", "max_parallel_workers", "worker_cli", "reviewer_cli", "priority", "daily_token_limit", "multi_user"]], ["set_group_merge", ["auto_merge", "frozen"]], ["set_group_queen", ["split_approval", "queen_answers_one_way"]]];
+// Each role a project may give a model of its own; the queen's is global only. An empty draft is "same as global".
+const MODEL_KEYS = ["model_worker", "model_reviewer", "model_splitter", "model_live_check", "model_bazras"];
+const SETTING_GROUPS = [["set_group_work", ["paused", "max_parallel_workers", "worker_cli", "reviewer_cli", "priority", "daily_token_limit", "multi_user"]], ["set_group_merge", ["auto_merge", "frozen"]], ["set_group_queen", ["split_approval", "queen_answers_one_way"]], ["set_group_models", MODEL_KEYS]];
 
 function settingsDraft(row) {
   return {name: row.name, ...Object.fromEntries(SETTING_GROUPS.flatMap(([, keys]) => keys).map(key => [key, row[key]]))};
@@ -2683,7 +2808,7 @@ function settingsCalls(name, was, now) {
   const project = encodeURIComponent(name);
   const path = (key, value) => key === "paused" ? `/projects/${project}/${value ? "pause" : "resume"}`
     : key === "max_parallel_workers" ? `/parallel?project=${encodeURIComponent(`${name}:${value}`)}`
-    : `/projects/${project}/settings?${key}=${encodeURIComponent(value)}`;
+    : `/projects/${project}/settings?${key}=${encodeURIComponent(MODEL_KEYS.includes(key) && !value ? "global" : value)}`;
   return [...SETTING_GROUPS.flatMap(([, keys]) => keys), "name"].filter(key => now[key] !== was[key]).map(key => ({setting: key, path: path(key, now[key])}));
 }
 
@@ -2740,7 +2865,7 @@ async function landForRename(button) {
   drawSettings();
 }
 
-const SETTING_LABELS = {name: "set_name", paused: "set_run_label", max_parallel_workers: "setting_workers", priority: "setting_priority", daily_token_limit: "setting_tokens", auto_merge: "setting_auto_merge", frozen: "setting_frozen", split_approval: "set_split_by", queen_answers_one_way: "set_one_way_by", worker_cli: "set_run_with", reviewer_cli: "set_review_with", multi_user: "set_multi_user"};
+const SETTING_LABELS = {name: "set_name", paused: "set_run_label", max_parallel_workers: "setting_workers", priority: "setting_priority", daily_token_limit: "setting_tokens", auto_merge: "setting_auto_merge", frozen: "setting_frozen", split_approval: "set_split_by", queen_answers_one_way: "set_one_way_by", worker_cli: "set_run_with", reviewer_cli: "set_review_with", multi_user: "set_multi_user", model_worker: "set_model_worker", model_reviewer: "set_model_reviewer", model_splitter: "set_model_splitter", model_live_check: "set_model_live_check", model_bazras: "set_model_bazras"};
 const SETTING_HINTS = {name: "set_name_hint", max_parallel_workers: "setting_workers_hint", priority: "setting_priority_hint", daily_token_limit: "setting_tokens_hint", auto_merge: "mode_auto_hint", frozen: "mode_frozen_hint", worker_cli: "set_run_with_hint", reviewer_cli: "set_review_with_hint", multi_user: "set_multi_user_hint"};
 
 // One setting's control, drawn from the draft. A pause set in the config shows and cannot move. Codex chosen, for the
@@ -2760,6 +2885,14 @@ function settingControl(key, row, now, codex = null) {
   if (key === "worker_cli" || key === "reviewer_cli") return seg([["claude", "cli_claude"], ["codex", "cli_codex"]], false, value === "codex" && codex?.why
     ? `<div class="sheet-note tone-amber" role="status" data-codex-why>${esc(fillIn("set_codex_why", {machine: codex.machine, why: tr(codex.why)}))}</div>` : "");
   if (key === "name") return `<div class="set-field stack">${head}<input type="text" class="name-field" dir="ltr" autocomplete="off" autocapitalize="off" spellcheck="false" data-draft="${key}" value="${esc(value)}" aria-label="${esc(label)}"></div>`;
+  if (MODEL_KEYS.includes(key)) {
+    // Its own model, or the global one marked as global; Claude's default when neither names one.
+    const global = row.global_models?.[key.slice(6)] || t("set_model_default");
+    const note = value ? `${t("set_model_own")} · ${t("set_model_global")}: ${global}` : `${t("set_model_from_global")}: ${global}`;
+    return `<div class="set-field stack"><div class="set-label"><span>${label}</span><small class="${value ? "" : "model-global"}" dir="auto">${esc(note)}</small></div>
+      <div class="model-row"><input type="text" class="name-field" dir="ltr" autocomplete="off" autocapitalize="off" spellcheck="false" data-draft="${key}" value="${esc(value)}" placeholder="${esc(global)}" aria-label="${esc(label)}">
+      <button type="button" class="btn small" data-draft="${key}" data-value=""${value ? "" : " disabled"}>${t("set_model_same")}</button></div></div>`;
+  }
   if (key === "daily_token_limit") return `<div class="set-field">${head}<input type="number" class="tokens-field" min="1" step="100000" dir="ltr" inputmode="numeric" data-draft="${key}" value="${esc(value)}" aria-label="${esc(label)}"></div>`;
   return key === "max_parallel_workers" || key === "priority" ? step() : flip();
 }
@@ -2815,7 +2948,7 @@ function changeDraft(control) {
   if (control.dataset.by) now[key] = Math.max(1, now[key] + Number(control.dataset.by));
   else if (control.dataset.value !== undefined) now[key] = {true: true, false: false}[control.dataset.value] ?? control.dataset.value;
   else if (control.getAttribute("role") === "switch") now[key] = !now[key];
-  else { now[key] = key === "name" ? control.value.trim() : control.value.trim() === "" ? "" : Number(control.value); setEdit.asking = false; $("setfoot").innerHTML = settingsFoot(setEdit); return; }
+  else { now[key] = key === "name" || MODEL_KEYS.includes(key) ? control.value.trim() : control.value.trim() === "" ? "" : Number(control.value); setEdit.asking = false; $("setfoot").innerHTML = settingsFoot(setEdit); return; }
   setEdit.asking = false;
   drawSettings();
   if ((key === "worker_cli" || key === "reviewer_cli") && now[key] === "codex") checkCodex(setEdit);
@@ -3423,6 +3556,7 @@ document.addEventListener("click", e => {
   if (hit("limits")) { changeLimits(hit("limits")); return; }
   if (hit("parallel")) { changeParallel(hit("parallel")); return; }
   if (hit("backup")) { changeBackup(hit("backup")); return; }
+  if (hit("release")) { showRelease(); return; }
   if (hit("upstream-check")) { act(hit("upstream-check"), "/upstream/check").then(() => refreshState()).catch(() => {}); return; }
   if (hit("upstream-bring")) { act(hit("upstream-bring"), "/upstream/bring-in").then(answer => { if (answer) toast(t(answer.created ? "upstream_task_made" : "upstream_task_there")); return refreshState(); }).catch(() => {}); return; }
   if (hit("requests")) { act(hit("requests"), `/requests?enabled=${hit("requests").dataset.requests}`).then(() => refreshState()).catch(() => {}); return; }
@@ -3547,6 +3681,7 @@ $("setsheet").addEventListener("close", () => { setEdit = null; markView(); });
 $("stop").onclick = e => act(e.currentTarget, "/stop");
 $("resume").onclick = e => act(e.currentTarget, "/resume");
 $("restart").onclick = e => act(e.currentTarget, "/restart");
+$("releasenow").onclick = e => cutRelease(e.currentTarget);
 
 // The Look menu lists every look the dashboard has, from the state, and marks the one this page is. A page that has
 // not read the state yet knows the two it came with. A choice is kept in this browser's cookie.

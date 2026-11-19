@@ -674,6 +674,11 @@ class GitHub:
         self._run(["label", "create", label, "--repo", repo, "--force", "--description", description])
         self._run(["api", f"repos/{repo}/issues/{number}/labels", "-X", "POST", "-f", f"labels[]={label}"])
 
+    def latest_release(self, repo):
+        """The newest published release of `repo`, as {"tag", "url"}. Raises GitHubError when it has none."""
+        data = self._json(["api", f"repos/{repo}/releases/latest"])
+        return {"tag": data["tag_name"], "url": data["html_url"]}
+
     def default_branch(self, repo):
         data = self._json(["repo", "view", repo, "--json", "defaultBranchRef"])
         return data["defaultBranchRef"]["name"]
@@ -716,6 +721,20 @@ class GitHub:
             if "Not Found" in str(e) or "HTTP 404" in str(e):
                 return None
             raise
+
+    def release(self, repo, tag):
+        """The GitHub release of a tag, or None when the tag has none."""
+        try:
+            return self._json(["api", f"repos/{repo}/releases/tags/{tag}"])
+        except GitHubError as e:
+            if "Not Found" in str(e) or "HTTP 404" in str(e):
+                return None
+            raise
+
+    def create_release(self, repo, tag, title, notes):
+        """Publishes a release of a tag that is already on GitHub. Returns its URL."""
+        return self._json(["api", f"repos/{repo}/releases", "-X", "POST", "-f", f"tag_name={tag}",
+                           "-f", f"name={title}", "-f", f"body={notes}"])["html_url"]
 
     def delete_branch(self, repo, branch):
         self._run(["api", "-X", "DELETE", f"repos/{repo}/git/refs/heads/{branch}"])

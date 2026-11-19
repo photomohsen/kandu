@@ -463,8 +463,8 @@ class Supervisor:
 
     # Running agents.
 
-    def _model(self, role):
-        return self.config.settings.claude.models.get(role)
+    def _model(self, role, project=None):
+        return self.config.model_for(project, role)
 
     def _rules(self, role):
         return getattr(self.config.settings.permissions, role)
@@ -518,7 +518,7 @@ class Supervisor:
         self._snapshot("awake")
         stop_one = self.store.worker_stop_file(run_id)
         # Claude's model setting is for Claude Code alone: another CLI runs on its own default.
-        model = self._model(role) if cli == CLAUDE else None
+        model = self._model(role, task.project) if cli == CLAUDE else None
         result = self.runner.run_agent(task.project.machine, cwd, prompt, allowed, denied, run_id,
                                        lambda: self._hard_stop() or stop_one.exists(), model, tokens,
                                        schema, resume, cli=cli, temp_files=temp_files)

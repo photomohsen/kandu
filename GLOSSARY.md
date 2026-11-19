@@ -10,6 +10,7 @@ One word for each concept. Use these words in code, docs, prompts and issues. A 
 | **Worker** | An agent that does one task in its own `git worktree` |
 | **Technical debt** | The column for tasks the user parked without refining them; no agent reads it, and Didban brings them up |
 | **Multi-user project** | A project whose board several people share, each with a Kandu of their own (`multi_user`); an install works only the tasks assigned to its own GitHub account |
+| **Project model** | The model one role runs on for one project (`models` in its entry); a role it does not name runs on the global `claude.models`, and the queen's is global only |
 | **Splitter** | A read-only agent that sizes every task in `Backlog` against the scale and proposes how to split a `Large` one |
 | **Queen answers one-way merges** | A project's switch, off by default: on, the queen's yes to a merge answers its one-way door and the review's questions for the user; off, those wait for the user's yes |
 | **Split approval** | Who accepts a project's split proposals, the user or the queen; the user by default, set in the registry or the dashboard's settings section |
@@ -21,6 +22,7 @@ One word for each concept. Use these words in code, docs, prompts and issues. A 
 | **Free flight** | A session the user opens on a task from the dashboard, with full access; Kandu's agents keep running beside it |
 | **Zanbourdar** | Persian for "beekeeper": a session the user opens beside Didban from the dashboard, with full access and tied to no task; it may change Kandu itself |
 | **Kanduban** | A session the user opens on one project from the dashboard, with full access, on the project's own machine in a worktree of its own; it works only in that project and brings its change in through a PR |
+| **Version badge** | The header's mark of the install's version, in every look, and whether it is the newest release of the public upstream, read once a day; it never updates the install |
 | **Handoff** | A job Didban hands to Zanbourdar, or to a project's Kanduban, on the user's yes, typed into that session by `kandu.handoff`, and the short report it sends back to Didban |
 | **Brief** | One short private file per project, `local/brief/<project>.md`, that Didban reads when the user names the project; it changes only through `kandu.brief` |
 | **Repo note** | `KANDU.md` in a project's repo, rendered by `kandu.note`: it says Kandu changes the repo, where its tasks are and how a breakage goes back to Kandu |
@@ -38,9 +40,11 @@ One word for each concept. Use these words in code, docs, prompts and issues. A 
 | **Task** | A GitHub issue on a board; only those with the label `agent` enter the loop |
 | **Token task** | An `agent` task labelled `uses-tokens`; its worker gets the project's `task_tokens` |
 | **Version** | Kandu's version number, such as `1.0.0`, held in the repo's `VERSION` file; the install reads it and reports it in `GET /state` |
+| **Cut a release** | The dashboard's action, in every look, and Didban's flow that show the next release's proposal, its version and changelog entry, and open the release PR only on the user's yes |
 | **Release** | A new version of Kandu: a PR on the private copy that `kandu.release` opens on the user's yes, with the next `VERSION` and its changelog entry |
 | **Changelog** | `CHANGELOG.md`, one entry for each release, newest first, its changes grouped as Breaking, Features, Fixes and Other |
 | **Breaking mark** | The `breaking` label, given to a task when it is defined (`kandu.tasks --breaking`) and carried to its PR, so a merged PR still says it was a breaking change |
+| **Publish** | The last step of Kandu's own deploy, `kandu.publish`: once a release is live and `main` is on the public upstream, it tags it `vX.Y.Z` there and creates its GitHub release with the changelog entry, after the private guard checked both |
 | **Ready task** | An `agent` task in `Ready` whose blockers are all done |
 | **Slice** | A task that delivers a complete path that can be verified alone |
 | **Blocker** | A review finding that the worker fixes and that stops the merge until it is gone |

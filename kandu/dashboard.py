@@ -4,6 +4,7 @@ The page has two looks, Kandu Clean in dashboard.html and Classic in classic.htm
 all it shows is open to any other system. Reads are open on the bound address; controls need a token.
 """
 import argparse
+import hashlib
 import hmac
 import json
 import os
@@ -19,9 +20,9 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from . import (add, backup, bazras, clean, flights, ghlimit, ghmeter, queen, questions, remove, rename, review, sessions, split,
                tasks, timer, tries, upstream, version, waits)
-from .config import (AGENT_CLIS, CLAUDE, CODEX, DEFAULT_LOCAL_DIR, NOTIFY_EVENTS, PACE_SETTINGS, REGISTRY_SETTINGS, TECHNICAL_DEBT,
-                     ConfigError, Inspect, UsageLimits,
-                     load_config, set_backup, set_clean_merged, set_drop_blockers, set_inspect, set_limits, set_pace,
+from .config import (AGENT_CLIS, CLAUDE, CODEX, DEFAULT_LOCAL_DIR, MODEL, NOTIFY_EVENTS, PACE_SETTINGS, PROJECT_MODEL_ROLES,
+                     REGISTRY_SETTINGS, TECHNICAL_DEBT, ConfigError, Inspect, UsageLimits,
+                     load_config, set_project_model, set_backup, set_clean_merged, set_drop_blockers, set_inspect, set_limits, set_pace,
                      set_default_look, set_notify_events, set_parallel, set_project_values, set_show_requests,
                      set_telegram_buttons)
 from .github import AGENT_LABEL, GitHubError, task_blockers
@@ -51,6 +52,7 @@ QUEUE_FRESH_SECONDS = 60
 QUEUE_RETRY_SECONDS = 300
 STREAM_POLL_SECONDS = 2
 EVENT_PAGE = 500
+SAME_AS_GLOBAL = "global"  # `model_ROLE=global`: the project's role runs on `claude.models` again
 RUN_ID = re.compile(r"r-[\w-]+")
 DAY = re.compile(r"\d{4}-\d{2}-\d{2}")
 MERGEABLE_COLUMNS = ("Ready", "In progress", "In review")  # the columns a cycle picks up
@@ -319,7 +321,7 @@ class ApiError(Exception):
 class Api:
     def __init__(self, config, store, github, logs_dir, token=None, clock=time.monotonic, start_cycle=timer.start_cycle,
                  local_dir=DEFAULT_LOCAL_DIR, timer_on=timer.timer_on, flights_=None, restart=timer.restart,
-                 backup_timer=timer.enable_backup, install_dir=upstream.INSTALL_DIR, gate=None, runner=None):
+                 backup_timer=timer.enable_backup, install_dir=upstream.INSTALL_DIR, gate=None, runner=None, release=None):
         self.config = config
         self.runner = runner  # asks a machine whether Codex can run there; a new Runner each time when not given
         self.gate = gate or ghlimit.GATE
@@ -335,6 +337,9 @@ class Api:
         self.restart_kandu = restart
         self.backup_timer = backup_timer
         self.upstream = upstream.Upstream(install_dir)
+        self.releases = version.Releases(install_dir)
+        self.release_command = release or (lambda args: run_release(install_dir, args))
+        self._release_lock = threading.Lock()  # one release at a time
         self.bot = telegram_bot.Bot(self, self._approve_from_telegram)  # it takes presses only once main() starts it
         self._config_stamp = config_stamp(local_dir)
         self._config_lock = threading.Lock()
@@ -400,6 +405,7 @@ class Api:
             "looks": list(LOOKS),
             "clean_merged": self.config.settings.supervisor.clean_merged,
             "upstream": self._upstream(),
+            "version_badge": self.releases.status(self.store, self.config.settings.upstream),
             "github_refused": self._github_refused(),
             "version": version.read(),
         }
@@ -437,9 +443,15 @@ class Api:
         return self._upstream()
 
     def upstream_tick(self, now=None):
-        """The dashboard's own clock: checks when `upstream.every_hours` passed since the last try."""
+        """The dashboard's own clock: checks when `upstream.every_hours` passed since the last try, and reads the
+        upstream's newest release when a day passed since the last read. Returns True when it checked."""
         self.refresh_config()
-        return self.upstream.tick(self.store, self.config.settings.upstream, now)
+        settings = self.config.settings.upstream
+        try:
+            self.releases.tick(self.store, self.github, settings, now)
+        except Exception:  # A failed read is logged by the tick; anything else must not stop the count.
+            pass
+        return self.upstream.tick(self.store, settings, now)
 
     def bring_in_updates(self, query):
         """Creates one task on the board of Kandu's own project to bring the commits in through a PR.
@@ -455,6 +467,54 @@ class Api:
             raise ApiError(409, str(e)) from None
         self._queue_time = None
         return {"task": task, "url": url, "created": created}
+
+    def release(self, query):
+        """What the next release would be, from `python -m kandu.release` with no yes: it changes nothing.
+
+        Answers `version`, the version now; `next`, the proposed one, or null when nothing changed since the last
+        release; `text`, what the command printed: the changes and the changelog entry; and `proposal`, the
+        fingerprint of that text, which the confirm must send back.
+        """
+        return self._propose()
+
+    def cut_release(self, query):
+        """Opens the release PR, with `python -m kandu.release --yes`, only for the proposal the user saw.
+
+        The proposal is read again first: when it is not the one whose fingerprint came back, because something
+        reached `main` since, nothing is opened and the page shows the new one. Nothing here tags or publishes.
+        """
+        seen = (query.get("proposal") or [""])[0]
+        with self._release_lock:
+            proposal = self._propose()
+            if proposal["next"] is None:
+                raise ApiError(409, "no change since the last release: there is nothing to release", proposal)
+            if not seen or seen != proposal["proposal"]:
+                raise ApiError(409, "the proposal changed since it was shown: look at it again", proposal)
+            out = self._release_run(["--yes"])
+        found = RELEASE_PR.search(out)
+        return {"version": proposal["next"], "url": found.group(1) if found else None}
+
+    def _propose(self):
+        out = self._release_run([])
+        none = RELEASE_NONE.search(out)
+        proposed = RELEASE_NEXT.search(out)
+        if none:
+            text, version_now, nxt = none.group(0), none.group(1), None
+        elif proposed:
+            text = RELEASE_ASKED.sub("", out).strip()
+            version_now = (RELEASE_SINCE.search(out) or proposed).group(1)
+            nxt = proposed.group(1)
+        else:
+            raise ApiError(502, "the release command printed no proposal")
+        return {"version": version_now, "next": nxt, "text": text,
+                "proposal": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]}
+
+    def _release_run(self, args):
+        code, out, err = self.release_command(args)
+        if code != 0:
+            said = (err or out or "").strip().splitlines()
+            raise ApiError(502, said[-1].removeprefix("release: ") if said else "the release command failed")
+        return out
 
     def _open_marks(self, marks):
         """The log's marks, with «waits for you» kept only on a task that is still open: its card on a board, not
@@ -1317,6 +1377,8 @@ class Api:
                  "max_parallel_workers": p.max_parallel_workers}
                 | {setting: self.store.project_setting(p, setting) for setting in PROJECT_SETTINGS}
                 | {setting: self._registry_value(p, setting) for setting in REGISTRY_SETTINGS}
+                | {f"model_{role}": p.models.get(role, "") for role in PROJECT_MODEL_ROLES}
+                | {"global_models": {role: self.config.settings.claude.models.get(role, "") for role in PROJECT_MODEL_ROLES}}
                 for p in self.config.projects]
 
     def codex_on(self, query, name):
@@ -1350,6 +1412,9 @@ class Api:
         `priority`, `daily_token_limit`, `auto_merge` and `frozen` are written in its entry in `projects.yaml`, and
         the next cycle uses them. Nothing is changed if any value is wrong.
 
+        `model_ROLE` names the model ROLE runs on for this project, in its entry's `models`; `model_ROLE=global`
+        takes it out, so the role runs on `claude.models` again. The next run uses it; a run at work keeps its model.
+
         `name` renames the project, in a call of its own (`kandu.rename`): Kandu then knows it only by the new name.
         """
         project = self._project(name)
@@ -1358,8 +1423,16 @@ class Api:
             raise ApiError(400, "give a setting, such as split_approval=user")
         if "name" in given:
             return self._rename(project, given)
-        changes, registry = {}, {}
+        changes, registry, models = {}, {}, {}
         for setting, text in given.items():
+            if setting.startswith("model_"):
+                role, model = setting.removeprefix("model_"), None if text == SAME_AS_GLOBAL else text
+                if role not in PROJECT_MODEL_ROLES:
+                    raise ApiError(400, f"{project.name}.models: not a role with a model of its own: {role}")
+                if model is not None and not MODEL.fullmatch(model):
+                    raise ApiError(400, f"{project.name}.models.{role}: not a model name: {model!r}")
+                models[role] = model
+                continue
             if setting in REGISTRY_SETTINGS:
                 registry[setting] = self._read_value(REGISTRY_SETTINGS[setting], setting, text)
                 continue
@@ -1378,11 +1451,21 @@ class Api:
             for setting, value in registry.items():
                 self.store.record("project_setting_changed", project=project.name, setting=setting,
                                   old=old[setting], new=value)
+        for role, model in models.items():
+            old = project.models.get(role)
+            try:
+                with self._add_lock:
+                    set_project_model(project.name, role, model, self.local_dir)
+            except ConfigError as e:
+                raise ApiError(400, e.problems[0]) from None
+            self.refresh_config()
+            self.store.record("project_setting_changed", project=project.name, setting=f"model_{role}", old=old, new=model)
+            project = self._project(project.name)
         for setting, value in changes.items():
             old = self.store.project_setting(project, setting)
             self.store.set_project_setting(project.name, setting, value)
             self.store.record("project_setting_changed", project=project.name, setting=setting, old=old, new=value)
-        return changes | registry
+        return changes | registry | {f"model_{role}": model or "" for role, model in models.items()}
 
     def _rename(self, project, given):
         if len(given) > 1:
@@ -1496,7 +1579,28 @@ ROUTES = [
     ("POST", "/backup", Api.change_backup),
     ("POST", "/upstream/check", Api.check_upstream),
     ("POST", "/upstream/bring-in", Api.bring_in_updates),
+    ("GET", "/release", Api.release),
+    ("POST", "/release", Api.cut_release),
 ]
+
+
+# What `python -m kandu.release` prints (DESIGN §12): the dashboard reads its words, and never imports it.
+RELEASE_NONE = re.compile(r"^No change since the last release \(([^)\s]+)\).*$", re.MULTILINE)
+RELEASE_SINCE = re.compile(r"^Changes since (\S+?):", re.MULTILINE)
+RELEASE_NEXT = re.compile(r"^Proposed version: (\S+)", re.MULTILINE)
+RELEASE_ASKED = re.compile(r"^Nothing changed\.\s*$", re.MULTILINE)
+RELEASE_PR = re.compile(r"^Release PR: (\S+)", re.MULTILINE)
+RELEASE_SECONDS = 180
+
+
+def run_release(install_dir, args):
+    """Runs the install's `python -m kandu.release` with no terminal, so without `--yes` it only proposes."""
+    try:
+        done = subprocess.run([sys.executable, "-m", "kandu.release", *args], cwd=install_dir, stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=RELEASE_SECONDS)
+    except subprocess.TimeoutExpired:
+        return 1, "", "the release command took too long"
+    return done.returncode, done.stdout, done.stderr
 
 
 def _pattern(template):
@@ -1659,7 +1763,7 @@ def main():
     api = Api(config, StateStore(), open_github(config), DEFAULT_LOGS_DIR, os.environ.get(TOKEN_ENV), local_dir=args.local)
     bind, port = config.settings.dashboard.bind, config.settings.dashboard.port
     ghmeter.sample_forever()  # the limit as GitHub sees it, beside the calls the meter counts
-    upstream.tick_forever(api.upstream_tick)  # does nothing while `upstream.enabled` is off
+    upstream.tick_forever(api.upstream_tick)  # does nothing while `upstream.enabled` is off; reads releases daily
     threading.Thread(target=api.bot.run_forever, daemon=True).start()  # Telegram's buttons; idle without a token
     server = ThreadingHTTPServer((bind, port), make_handler(api))
     print(f"dashboard: http://{bind}:{port}")
