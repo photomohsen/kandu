@@ -27,7 +27,7 @@ from .flights import Flights
 from .github import TOKENS_LABEL, GitHubError, blockers_in, branch_for, task_blockers, transient
 from .mirror import open_github
 from .notify import CHECK_NOT_RUN, LIVE_DOWN, QUEEN_MAY_ACCEPT, TESTS_FAIL_IN, notifier_for
-from .runner import AGENT_CLIS, CLAUDE, CODEX, DEFAULT_LOGS_DIR, LocalWork, Runner, RunnerError, Unreachable
+from .runner import CLAUDE, CODEX, DEFAULT_LOGS_DIR, LocalWork, Runner, RunnerError, Unreachable
 from .state import StateStore
 from .tasks import TaskError
 from .tries import FAILURE_COMMENT, INTERNAL_TRIES, SIZING_FAILURE_COMMENT, count as count_tries
@@ -681,10 +681,9 @@ class Supervisor:
         self._phase(task, f"review round {round_number}")
         to_fix = self._to_fix(task, reviews[-1]) if reviews else []
         language = self.config.settings.language
-        # A second review checks the first one's findings, so it runs on the same agent CLI; a first one on the choice.
-        cli = reviews[-1].get("cli", CLAUDE) if to_fix else self._cli(task.project, "reviewer")
-        if cli not in AGENT_CLIS:
-            cli = self._cli(task.project, "reviewer")
+        # Every review, a second one too, runs on the project's choice as it stands: a switch away from a CLI that
+        # cannot review on this machine reaches the next round, and the earlier findings carry over whoever wrote them.
+        cli = self._cli(task.project, "reviewer")
         if to_fix:
             prompt = agents.second_review_prompt(task.repo, task.number, pr["number"], head, language, to_fix,
                                                  self.github.default_branch(task.repo), self._copy(task.project))

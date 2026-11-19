@@ -1992,7 +1992,7 @@ class CodexReviewerTest(Base):
         self.assertEqual([f["n"] for f in second["open"]], [1])  # the blocker not fixed is carried over
         self.assertEqual([e["blockers"] for e in self.events("review_finished")], [1, 1])
 
-    def test_the_second_review_runs_on_the_program_of_the_first(self):
+    def test_a_second_review_takes_the_choice_made_since(self):
         def fix_while_the_user_chooses_claude():
             self.store.set_project_setting("website", "reviewer_cli", "claude")
             return self.worker_pushes(SHA2)()
@@ -2000,7 +2000,11 @@ class CodexReviewerTest(Base):
         self.runner.steps = [self.worker_makes_pr(), report(SHA1, [BLOCKER]), fix_while_the_user_chooses_claude,
                              report(SHA2, earlier=[{"n": 1, "result": "fixed", "body": "ok"}])]
         self.cycle()
-        self.assertEqual(self.clis(), ["claude", "codex", "claude", "codex"])
+        self.assertEqual(self.clis(), ["claude", "codex", "claude", "claude"])
+        self.assertIn("This breaks.", self.runner.runs[3].prompt)  # Claude is asked about Codex's blocker
+        second = review.reviews_on(self.github.prs[(REPO, 1)], ACCOUNT)[1]
+        self.assertTrue(second["second"])
+        self.assertEqual([e["blockers"] for e in self.events("review_finished")], [1, 0])
 
     def test_a_second_review_whose_first_names_an_unknown_program_runs_on_the_projects_choice(self):
         def fix_after_the_first_review_names_gemini():
