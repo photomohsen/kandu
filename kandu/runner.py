@@ -21,7 +21,8 @@ from . import ghmeter
 from .config import AGENT_CLIS, CLAUDE, CODEX
 from .didban import remote_path
 from .state import usage_from_result
-from .usage import CODEX_LOGGED_OUT, CODEX_NO_ANSWER, CODEX_NOT_INSTALLED, TIMEOUT_SECONDS as CODEX_LOGIN_TIMEOUT
+from .usage import (CODEX_LOGGED_OUT, CODEX_NO_ANSWER, CODEX_NO_SANDBOX, CODEX_NOT_INSTALLED, CODEX_SANDBOX_PROBE,
+                    TIMEOUT_SECONDS as CODEX_LOGIN_TIMEOUT)
 
 DEFAULT_LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
 GIT_TIMEOUT_SECONDS = 300
@@ -85,6 +86,7 @@ class AgentResult:
     stopped: bool = False
     session_id: str | None = None  # A broken reply is asked for again in this session.
     cli: str = CLAUDE  # ... and with this agent CLI.
+    no_command_started: bool = False  # It tried commands and none started: its machine, not its work, failed.
 
 
 class Host:
@@ -261,8 +263,10 @@ done
 echo "{program}: not found" >&2
 exit 127
 """
-# Codex's answer for this machine: 127 when there is no `codex` on its PATH, else `codex login status`'s own.
-CODEX_LOGIN = 'command -v codex >/dev/null 2>&1 || exit 127; exec codex login status >/dev/null 2>&1'
+# Codex's answer for this machine: 127 when there is no `codex` on its PATH, 1 when `codex login status` fails, 3 when
+# its sandbox cannot run a command there.
+CODEX_LOGIN = ('command -v codex >/dev/null 2>&1 || exit 127; codex login status >/dev/null 2>&1 || exit 1; '
+               f'codex {" ".join(CODEX_SANDBOX_PROBE)} >/dev/null 2>&1 || exit 3')
 
 
 def _case_pattern(rest):
@@ -355,6 +359,8 @@ class _CodexReply:
         self.text = ""
         self.tokens = None
         self.failed = False
+        self.commands_tried = 0
+        self.commands_started = 0
 
     def read(self, line):
         event = _event(line)
@@ -364,6 +370,11 @@ class _CodexReply:
             self.session_id = event.get("thread_id")
         elif isinstance(item, dict) and item.get("type") == "agent_message" and isinstance(item.get("text"), str):
             self.text = item["text"]
+        elif isinstance(item, dict) and item.get("type") == "command_execution":
+            # A command that ran has its own exit code, 0 or not; one Codex could not start has none, or -1.
+            self.commands_tried += 1
+            code = item.get("exit_code")
+            self.commands_started += isinstance(code, int) and not isinstance(code, bool) and code >= 0
         elif kind == "turn.completed":
             usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
             cached = usage.get("cached_input_tokens", 0)
@@ -386,7 +397,8 @@ class _CodexReply:
                 pass  # a reply that cannot be read stays as it is, to be asked for again
         return AgentResult(text=text, models={self.model: self.tokens} if self.tokens else {},
                            duration_ms=duration_ms, stopped=stopped, session_id=self.session_id, cli=CODEX,
-                           is_error=self.failed or self.tokens is None or returncode != 0)
+                           is_error=self.failed or self.tokens is None or returncode != 0,
+                           no_command_started=self.commands_tried > 0 and self.commands_started == 0)
 
 
 def _put_schema(host, schema):
@@ -528,7 +540,7 @@ class Runner:
                           cwd=directory).splitlines()
 
     def codex_login(self, machine):
-        """None when Codex is installed and logged in on `machine`; otherwise why not. `Unreachable` when the
+        """None when Codex is installed and logged in on `machine` and its sandbox runs a command; otherwise why not. `Unreachable` when the
         machine does not answer: that says nothing of Codex."""
         host = self.hosts[machine]
         try:
@@ -539,7 +551,7 @@ class Runner:
             return CODEX_NO_ANSWER
         if found.returncode == 0:
             return None
-        return CODEX_NOT_INSTALLED if found.returncode == 127 else CODEX_LOGGED_OUT
+        return {127: CODEX_NOT_INSTALLED, 3: CODEX_NO_SANDBOX}.get(found.returncode, CODEX_LOGGED_OUT)
 
     def prepare_review(self, project, repo, branch, head_sha):
         """Returns a detached checkout of exactly `head_sha`, apart from the worker's worktree."""

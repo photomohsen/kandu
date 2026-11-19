@@ -29,6 +29,10 @@ CODEX_REQUESTS = "".join(json.dumps(request) + "\n" for request in (
 CODEX_NOT_INSTALLED = "not installed"
 CODEX_LOGGED_OUT = "not logged in; run: codex login"
 CODEX_NO_ANSWER = "codex login status did not answer"
+CODEX_NO_SANDBOX = "its sandbox cannot run a command here"
+# A command every machine Kandu works on has, run in Codex's own sandbox: Codex logged in is not Codex able to work,
+# as on a Windows machine reached over SSH, whose session no Codex sandbox can start a command in.
+CODEX_SANDBOX_PROBE = ["sandbox", "--", "git", "--version"]
 DAY_MINUTES = 24 * 60  # a Codex window this long or shorter is its 5-hour one; a longer one is its week
 
 
@@ -186,20 +190,29 @@ def read_codex_usage():
         server.wait()
 
 
-def codex_login():
-    """None when Codex is logged in on this machine; otherwise why not, in fixed words."""
+def _codex_answer(args):
+    """`codex args`'s exit code, or None when it does not end in time."""
+    process = _start_codex(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
-        status = _start_codex(["login", "status"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                              stderr=subprocess.DEVNULL)
+        return process.wait(timeout=TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        _stop_codex(process)
+        process.wait()
+        return None
+
+
+def codex_login():
+    """None when Codex is logged in on this machine and its sandbox runs a command; otherwise why not, in fixed
+    words."""
+    try:
+        code = _codex_answer(["login", "status"])
     except FileNotFoundError:
         return CODEX_NOT_INSTALLED
-    try:
-        code = status.wait(timeout=TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        _stop_codex(status)
-        status.wait()
+    if code is None:
         return CODEX_NO_ANSWER
-    return None if code == 0 else CODEX_LOGGED_OUT
+    if code != 0:
+        return CODEX_LOGGED_OUT
+    return None if _codex_answer(CODEX_SANDBOX_PROBE) == 0 else CODEX_NO_SANDBOX
 
 
 def over_limit(usage, limits, who=""):

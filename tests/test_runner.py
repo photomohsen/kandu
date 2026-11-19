@@ -735,10 +735,26 @@ class ChangedPathsTest(GitCase):
                          ["kept.sql", "migrations/001.sql"])
 
 
+# A `codex` that is logged in and whose sandbox runs `git --version`, as Kandu asks of it.
+WORKING_CODEX = """#!/bin/sh
+case "$*" in
+  "login status") exit 0 ;;
+  "sandbox -- git --version") exec "$3" "$4" ;;
+esac
+exit 9
+"""
+
+
 class CodexLoginTest(GitCase):
     def test_codex_logged_in_on_a_machine(self):
-        install(self.home / ".local" / "bin" / "codex", "#!/bin/sh\n[ \"$1 $2\" = \"login status\" ]\n")
+        install(self.home / ".local" / "bin" / "codex", WORKING_CODEX)
         self.assertIsNone(self.runner.codex_login("box"))
+
+    def test_codex_logged_in_whose_sandbox_runs_nothing_cannot_work(self):
+        # As on a Windows machine reached over SSH: logged in, but no command starts in its sandbox.
+        install(self.home / ".local" / "bin" / "codex",
+                '#!/bin/sh\n[ "$*" = "login status" ] && exit 0\necho "windows sandbox failed" >&2\nexit 1\n')
+        self.assertEqual(self.runner.codex_login("box"), "its sandbox cannot run a command here")
 
     def test_codex_logged_out_on_a_machine(self):
         install(self.home / ".local" / "bin" / "codex", "#!/bin/sh\necho 'Not logged in' >&2\nexit 1\n")
@@ -805,6 +821,26 @@ class CodexTest(GitCase):
                          ("the reply", False, False, "t-1"))
         self.assertEqual(result.cli, "codex")
         self.assertFalse((self.home / "claude.args").exists())
+
+    def test_a_run_whose_commands_ran_says_so(self):
+        self.assertFalse(self.codex().no_command_started)
+        failed = dict(CODEX_EVENTS[4], item=dict(CODEX_EVENTS[4]["item"], exit_code=1, status="failed"))
+        self.events(CODEX_EVENTS[:4] + [failed] + CODEX_EVENTS[5:])
+        self.assertFalse(self.codex().no_command_started)  # a command that ran and failed still ran
+
+    def test_a_run_whose_commands_could_not_start_says_so(self):
+        refused = {"id": "item_1", "type": "command_execution", "command": "ls", "status": "failed", "exit_code": -1,
+                   "aggregated_output": "Failed to create unified exec process: timed out after 15000ms"}
+        self.events(CODEX_EVENTS[:4] + [{"type": "item.completed", "item": refused},
+                                        {"type": "item.completed", "item": dict(refused, exit_code=None)}]
+                    + CODEX_EVENTS[5:])
+        result = self.codex()
+        self.assertTrue(result.no_command_started)
+        self.assertFalse(result.is_error)  # its reply is read as ever; the supervisor judges it
+
+    def test_a_run_that_tried_no_command_is_not_held_for_it(self):
+        self.events([e for e in CODEX_EVENTS if (e.get("item") or {}).get("type") != "command_execution"])
+        self.assertFalse(self.codex().no_command_started)
 
     def test_a_model_is_passed_only_when_one_is_set(self):
         self.codex()

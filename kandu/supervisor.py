@@ -528,6 +528,12 @@ class Supervisor:
             raise StoppedByUser(f"{role} run {run_id} was stopped by the user")
         if result.stopped:
             self._halt(CUT_OFF)
+        if result.no_command_started:
+            # Not the task's fault, as when Codex cannot start there at all: nothing it says counts, and the task goes
+            # on in a later cycle.
+            why = f"Codex on {task.project.machine}: {role} run {run_id} could start no command"
+            self._decide(task, "codex_unavailable", why)
+            raise CycleStop(why)
         if result.is_error:
             self._wait_for_usage(cli)  # A run cut off by a limit is not the task's fault.
             raise KanduTrouble(f"{role} run {run_id} ended with an error")

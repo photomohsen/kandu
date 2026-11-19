@@ -2082,6 +2082,22 @@ class CodexReviewerTest(Base):
         self.cycle()
         self.assertEqual(self.clis(), ["claude", "codex"])
 
+    def test_a_codex_review_that_could_start_no_command_counts_for_nothing(self):
+        refused = AgentResult(text=report(SHA1, [BLOCKER]), models={"codex": {"input": 1, "output": 1}},
+                              duration_ms=1, is_error=False, cli="codex", no_command_started=True)
+        self.runner.steps = [self.worker_makes_pr(), refused]
+        self.cycle()
+        self.assertEqual(self.clis(), ["claude", "codex"])
+        self.assertEqual(self.events("review_finished"), [])  # its blocker is not posted or counted
+        self.assertEqual(self.events("task_finished"), [])
+        self.assertEqual(self.github.status(1), "In review")  # the review comes in a later cycle
+        said = [e["reason"] for e in self.events("decision") if e["decision"] == "codex_unavailable"]
+        self.assertEqual(len(said), 1)
+        self.assertIn("could start no command", said[0])
+        self.runner.steps = [report(SHA1)]
+        self.cycle()
+        self.assertEqual(self.events("review_finished")[0]["blockers"], 0)
+
     def test_only_a_codex_review_may_write_temp_files(self):
         self.config.projects[0].agent_cli = {"worker": "codex", "reviewer": "codex"}
         self.runner.steps = [self.worker_makes_pr(), report(SHA1)]

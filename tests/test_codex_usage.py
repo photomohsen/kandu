@@ -152,10 +152,14 @@ class ReadCodexUsageTest(unittest.TestCase):
 
 
 class CodexLoginTest(unittest.TestCase):
-    def status(self, code=0, missing=False):
-        script = None if missing else f'#!/bin/sh\n[ "$*" = "login status" ] || exit 9\necho "Logged in"\nexit {code}\n'
+    def status(self, code=0, missing=False, sandbox=0):
+        script = None if missing else (f'#!/bin/sh\n[ "$*" = "sandbox -- git --version" ] && exit {sandbox}\n'
+                                       f'[ "$*" = "login status" ] || exit 9\necho "Logged in"\nexit {code}\n')
         with Codex(script):
             return codex_login()
+
+    def test_a_sandbox_that_runs_nothing_says_so(self):
+        self.assertEqual(self.status(sandbox=1), "its sandbox cannot run a command here")
 
     def test_logged_in_is_none(self):
         self.assertIsNone(self.status())
