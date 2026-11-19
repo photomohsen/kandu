@@ -163,7 +163,7 @@ return {chosen, back: els.setbody.innerHTML, sent: [...sent]};""", [{"machine": 
         result = self.run_js(self.line("let setEdit = ") + "".join(self.function(n) for n in ("openSettings", "checkCodex", "drawSettings")) + f"""
 let lastState = {{project_settings: [{json.dumps(row("website", worker_cli="codex"))}]}};
 const els = {{setbody: {{innerHTML: ""}}, setfoot: {{innerHTML: ""}}, setsheet: {{showModal() {{}}}}}};
-const $ = id => els[id];
+const $ = id => els[id], markView = () => {{}};  // the page's address has no part here (#94)
 const asked = [];
 globalThis.get = async path => {{ asked.push(path); return {{machine: "server", why: "not installed"}}; }};
 openSettings("website"); await new Promise(resolve => setTimeout(resolve, 0));
@@ -173,7 +173,7 @@ return {{asked, body: els.setbody.innerHTML}};""")
         self.assertEqual(self.run_js(self.line("let setEdit = ") + "".join(self.function(n) for n in ("openSettings", "checkCodex", "drawSettings")) + f"""
 let lastState = {{project_settings: [{json.dumps(ROWS[0])}]}};
 const els = {{setbody: {{innerHTML: ""}}, setfoot: {{innerHTML: ""}}, setsheet: {{showModal() {{}}}}}};
-const $ = id => els[id];
+const $ = id => els[id], markView = () => {{}};  // the page's address has no part here (#94)
 const asked = [];
 globalThis.get = async path => {{ asked.push(path); return null; }};
 openSettings("website"); return asked;"""), [])  # a project on Claude Code asks nothing of Codex
@@ -238,7 +238,7 @@ return {both, asked: [...asked], one: els.setbody.innerHTML};""", [{"machine": "
         result = self.run_js(self.line("let setEdit = ") + "".join(self.function(n) for n in ("openSettings", "checkCodex", "drawSettings")) + f"""
 let lastState = {{project_settings: [{json.dumps(row("website", reviewer_cli="codex"))}]}};
 const els = {{setbody: {{innerHTML: ""}}, setfoot: {{innerHTML: ""}}, setsheet: {{showModal() {{}}}}}};
-const $ = id => els[id];
+const $ = id => els[id], markView = () => {{}};  // the page's address has no part here (#94)
 const asked = [];
 globalThis.get = async path => {{ asked.push(path); return {{machine: "server", why: "not installed"}}; }};
 openSettings("website"); await new Promise(resolve => setTimeout(resolve, 0));
@@ -349,7 +349,7 @@ return settingsFoot({{was: settingsDraft(r), now: {{...settingsDraft(r), auto_me
         handler = self.page.split('document.addEventListener("click", e => {')[1].split("\n});\n")[0]
         self.assertIn('if (hit("set-no")) { setEdit.asking = false; drawSettings(); return; }', handler)
         self.assertIn('if (hit("set-cancel")) { $("setsheet").close(); return; }', handler)
-        self.assertIn('$("setsheet").addEventListener("close", () => { setEdit = null; });', self.page)
+        self.assertIn('$("setsheet").addEventListener("close", () => { setEdit = null; markView(); });', self.page)
         self.assertIn("now: settingsDraft(row)", self.function("openSettings"))
 
     # The pop-up at work: its own functions on stand-ins for the page, the server and the controls.
@@ -361,7 +361,8 @@ return settingsFoot({{was: settingsDraft(r), now: {{...settingsDraft(r), auto_me
         page = "".join(self.function(name) for name in ("openSettings", "checkCodex", "drawSettings", "changeDraft", "saveSettings",
                                                          "landForRename"))
         return self.run_js(self.line("let setEdit = ") + page + f"""
-let token = {json.dumps(TOKEN)}, lastState = {{project_settings: {json.dumps(ROWS)}}}, server = () => true;
+const markView = () => {{}};  // the page's address, which this pop-up alone has no part in (#94)
+let token ={json.dumps(TOKEN)}, lastState = {{project_settings: {json.dumps(ROWS)}}}, server = () => true;
 const sent = [], toasts = [], els = {{setbody: {{innerHTML: "", scrollTop: 0}}, setfoot: {{innerHTML: ""}}, setsheet: {{open: false}}}};
 els.setsheet.showModal = () => {{ els.setsheet.open = true; }};
 els.setsheet.close = () => {{ els.setsheet.open = false; setEdit = null; }};  // as the page's close listener does
