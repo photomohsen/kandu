@@ -27,7 +27,7 @@ Everything is configured by talking to an LLM in a Claude Code session. The one 
 
 ### A. Initial setup — once per install (`/kandu-setup`)
 1. Where does Kandu's brain (the supervisor) run: this machine or another one? Is that machine always on?
-2. Which other machines are on the network, how are they reached (SSH alias), and which of them are always on?
+2. Which other machines are on the network, how are they reached (SSH alias), and which of them are always on? Should any give each run its own temporary folder on its own disk (`run_tmp`, off by default, §9)?
 3. Claude access: subscription or API key? Usage limits: 5-hour window %, weekly %.
 4. GitHub account, and the owners (users / orgs) Kandu may work in.
 5. Where notifications go (Telegram or nowhere), which language Kandu talks to you in (`language`, default English), and which language its notifications use (`notify.language`, default `language`).
@@ -303,6 +303,7 @@ v1:
   - The queen's check and the live check stay on Claude Code whatever the project chose.
 - In the code, running a worker sits behind its own layer ([kandu/runner.py](kandu/runner.py)), so isolation can be added later by swapping only that layer.
 - Each agent run and each run of a project's `test` is in its own systemd scope on its machine (`systemd-run --user --scope`). When the run ends, fails, times out or is stopped, Kandu stops that scope, so every process the run started ends with it: a dev server, a test browser, anything put in the background or detached. Over SSH this also ends a stopped agent at once. A deploy is not in a scope, because it may start what must keep running. A machine with no user systemd runs the command as it is, and leftovers stay.
+- A machine may give each run a **run temporary folder** on its own disk (`run_tmp` and `run_tmp_dir` in its entry under `machines`), for a machine whose system temporary folder is small or in memory. It is off by default, and off, runs use the system temporary folder as before. On, each agent run, `test` and `setup` there gets a fresh folder `<run_tmp_dir>/kandu-<run>-<id>`, named like its scope, as `TMPDIR`, and an agent run as `CLAUDE_CODE_TMPDIR` too; locally and over SSH alike. The folder's `.kandu-run` file names the process that owns it. When the run ends, fails, times out or is stopped, Kandu removes the folder, after its scope. Before each run starts there, every `kandu-*` folder in `run_tmp_dir` older than a day whose owner is no longer running is removed: what a run left when Kandu itself was stopped or a connection dropped. Nothing else in the folder, and nothing in the system temporary folder, is touched. A deploy gets no run folder, as it gets no scope. The owner turns it on and sets the folder per machine from the dashboard's settings, in every look (`run_tmp_changed`), or with `kandu.add machine --run-tmp-dir`; `/kandu-setup` and `/kandu-add` ask about it for each new machine.
 
 If you want isolation now, two options:
 - **Separate Linux user:** a `kandu` user that owns the work folder and only has access to the registered repos and their secrets. Simple, little overhead; isolation is only as good as file permissions.
