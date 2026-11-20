@@ -6,9 +6,8 @@ settings the dashboard chose and its open requests. The event log is never edite
 `state/renames.json`, and each event written before it is read under the new name, so its token history and its
 events count as one project. Its copy, repo, board and issues stay as they are.
 
-A rename is refused while a supervisor cycle runs, or a worker or a free flight runs on the project, naming each one
-so the page can say what to wait for or close; and when the new name is empty, is not lowercase letters, digits and
-dashes, or is another project's.
+A rename is refused while a supervisor cycle runs, or a worker or a free flight runs on the project, and when the new
+name is empty, is not lowercase letters, digits and dashes, or is another project's.
 """
 import fcntl
 import os
@@ -31,11 +30,7 @@ KEPT = "Kandu still keeps a memory, brief or Bazras report under this name"
 
 
 class RenameError(Exception):
-    """Why a rename was refused. `running` lists what runs, when that is why (see `running`)."""
-
-    def __init__(self, message, running=()):
-        super().__init__(message)
-        self.running = list(running)
+    pass
 
 
 def _entry_line(name):
@@ -65,12 +60,9 @@ def kandu_text(text, old, new):
 
 
 def running(store, name):
-    """What runs on the project: each worker, then each free flight open on one of its tasks, with its task and since
-    when, and a flight with the key that closes it. Empty when nothing runs."""
-    workers = [{"kind": "worker", "task": w.get("task"), "since": w.get("started")}
-               for w in store.read_current().get("workers", []) if w.get("project") == name]
-    return workers + [{"kind": "flight", "task": f.get("task"), "since": f.get("started"), "key": f.get("key")}
-                      for f in store.flights() if f.get("kind") == "task" and f.get("project") == name]
+    """True while a worker or a free flight runs on the project."""
+    workers = any(w.get("project") == name for w in store.read_current().get("workers", []))
+    return workers or any(f.get("kind") == "task" and f.get("project") == name for f in store.flights())
 
 
 @contextmanager
@@ -85,7 +77,7 @@ def _no_cycle(store):
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise RenameError(RUNNING, [{"kind": "cycle"}]) from None
+            raise RenameError(RUNNING) from None
         yield
 
 
@@ -129,9 +121,8 @@ def rename_project(old, new, store, local_dir=DEFAULT_LOCAL_DIR, now=None):
     if any(p.name == new for p in config.projects):
         raise RenameError(TAKEN)
     with _no_cycle(store):
-        busy = running(store, old)
-        if busy:
-            raise RenameError(RUNNING, busy)
+        if running(store, old):
+            raise RenameError(RUNNING)
         return _rename(old, new, store, local_dir, now)
 
 

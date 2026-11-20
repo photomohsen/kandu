@@ -1,7 +1,6 @@
 """The Settings page (#46): the projects as a list, each opening its settings in a pop-up that changes only on Save,
 and beside them the usage limits, the machines and Kandu's own switches and pace. The page's own functions run in node
 on the state the API gives; the calls a Save makes go to the real API, as the page sends them."""
-import html as html_text
 import json
 import os
 import re
@@ -22,15 +21,14 @@ from tests.test_today import NODE, QUEUE, ROOT, Page, state
 LINES = ("const MODEL_KEYS = ", "const SETTING_GROUPS = ", "const SETTING_LABELS = ", "const SETTING_HINTS = ", "const LIMIT_STEP = ")
 FUNCTIONS = ("settingsProjects", "settingsProjectsHtml", "settingsDraft", "settingsCalls", "mergeOnAsked", "saveStep",
              "applySettings", "settingsBody", "settingsFoot", "settingControl", "stepper", "limitsHtml", "machinesHtml",
-             "kanduHtml", "runTmpRow", "switchRow", "defaultLookHtml", "runningList", "kandubanOf", "flightControls", "kandubanControls")
+             "kanduHtml", "runTmpRow", "switchRow", "defaultLookHtml", "kandubanOf", "flightControls", "kandubanControls")
 TOKEN = "secret-token"
 
 
 def row(name, **fields):
     return {"name": name, "paused": False, "paused_in_config": False, "max_parallel_workers": 1,
             "split_approval": "user", "queen_answers_one_way": False, "priority": 1, "daily_token_limit": 2000000,
-            "auto_merge": False, "frozen": False, "worker_cli": "claude", "reviewer_cli": "claude",
-            "model_worker": "", "model_reviewer": "", "model_splitter": "",
+            "auto_merge": False, "frozen": False, "model_worker": "", "model_reviewer": "", "model_splitter": "",
             "model_live_check": "", "model_bazras": "",
             "global_models": {"worker": "", "reviewer": "", "splitter": "claude-sonnet-5-5", "live_check": "", "bazras": ""}} | fields
 
@@ -101,7 +99,7 @@ class SettingsPageTest(unittest.TestCase, Page):
         at = [html.index(f">{h}<") for h in heads]
         self.assertEqual(at, sorted(at))
         work, merge, queen = html[at[0]:at[1]], html[at[1]:at[2]], html[at[2]:]
-        for setting in ("paused", "max_parallel_workers", "worker_cli", "reviewer_cli", "priority", "daily_token_limit"):
+        for setting in ("paused", "max_parallel_workers", "priority", "daily_token_limit"):
             self.assertIn(f'data-draft="{setting}"', work, setting)
         for setting in ("auto_merge", "frozen"):
             self.assertIn(f'data-draft="{setting}"', merge, setting)
@@ -109,146 +107,6 @@ class SettingsPageTest(unittest.TestCase, Page):
             self.assertIn(f'data-draft="{setting}"', queen, setting)
         self.assertIn('value="2000000"', work)  # its daily tokens
         self.assertIn('<b class="number">2</b>', work)  # two workers at most
-
-    # Run with: Claude Code or Codex (#81).
-
-    def test_the_pop_up_shows_run_with_claude_code_or_codex_with_the_projects_choice(self):
-        for r, pressed in ((ROWS[0], "claude"), (row("website", worker_cli="codex"), "codex")):
-            field = self.body(r).split('data-draft="max_parallel_workers"')[-1].split('data-draft="priority"')[0]
-            self.assertIn(">Run with<", field)
-            self.assertIn(self.text["en"]["set_run_with_hint"], field)
-            buttons = re.findall(r'data-draft="worker_cli" data-value="(\w+)" aria-pressed="(\w+)"[^>]*>([^<]*)<', field)
-            self.assertEqual(buttons, [("claude", str(pressed == "claude").lower(), "Claude Code"),
-                                       ("codex", str(pressed == "codex").lower(), "Codex")])
-            self.assertNotIn("data-codex-why", field)  # nothing is said before the machine answers
-
-    def test_run_with_reads_in_persian(self):
-        field = self.body(ROWS[0], "fa").split('data-draft="max_parallel_workers"')[-1].split('data-draft="priority"')[0]
-        self.assertEqual(self.text["fa"]["set_run_with"], "اجرا با")
-        for key in ("set_run_with", "set_run_with_hint", "cli_claude", "cli_codex"):
-            self.assertIn(self.text["fa"][key], field, key)
-
-    def codex_popup(self, script, answers, lang="en"):
-        """The website's pop-up, whose machine answers each ask with the next of `answers`: the API's answer."""
-        return self.popup(f"""
-const asked = [], answers = {json.dumps(answers)};
-globalThis.get = async path => {{ asked.push(path); return answers.shift(); }};
-const settle = () => new Promise(resolve => setTimeout(resolve, 0));
-{script}""", lang)
-
-    def test_choosing_codex_on_a_machine_without_a_working_codex_shows_the_doctors_reason_beside_the_switch(self):
-        result = self.codex_popup("""
-press("worker_cli", "codex"); await settle();
-const chosen = {asked: [...asked], body: els.setbody.innerHTML, calls: settingsCalls("website", setEdit.was, setEdit.now)};
-press("worker_cli", "claude"); await settle();
-return {chosen, back: els.setbody.innerHTML, sent: [...sent]};""", [{"machine": "server", "why": "not logged in; run: codex login"}])
-        self.assertEqual(result["chosen"]["asked"], ["/projects/website/codex"])
-        field = result["chosen"]["body"].split('data-draft="max_parallel_workers"')[-1].split('data-draft="priority"')[0]
-        self.assertIn('data-draft="worker_cli" data-value="codex" aria-pressed="true"', field)
-        self.assertIn("data-codex-why>Codex cannot run on server: not logged in; run: codex login</div>", field)
-        self.assertEqual(result["chosen"]["calls"], [{"setting": "worker_cli", "path": "/projects/website/settings?worker_cli=codex"}])
-        self.assertNotIn("data-codex-why", result["back"])  # Claude Code chosen again: nothing about Codex
-        self.assertEqual(result["sent"], [])  # nothing is saved before Save
-
-    def test_the_reason_reads_in_persian(self):
-        for why, said in (("not installed", "نصب نیست"), ("not logged in; run: codex login", "واردش نشده‌ای؛ اجرا کن: codex login"),
-                          ("codex login status did not answer", "codex login status جواب نداد"),
-                          ("the machine does not answer", "ماشین جواب نمی‌دهد")):
-            body = self.codex_popup('press("worker_cli", "codex"); await settle(); return els.setbody.innerHTML;',
-                                    [{"machine": "server", "why": why}], "fa")
-            self.assertIn(f"data-codex-why>Codex روی server اجرا نمی‌شود: {said}</div>", body, why)
-
-    def test_a_machine_where_codex_works_says_nothing(self):
-        body = self.codex_popup('press("worker_cli", "codex"); await settle(); return els.setbody.innerHTML;',
-                                [{"machine": "server", "why": None}])
-        self.assertNotIn("data-codex-why", body)
-
-    def test_a_project_on_codex_asks_its_machine_when_its_pop_up_opens(self):
-        result = self.run_js(self.line("let setEdit = ") + "".join(self.function(n) for n in ("openSettings", "checkCodex", "drawSettings")) + f"""
-let lastState = {{project_settings: [{json.dumps(row("website", worker_cli="codex"))}]}};
-const els = {{setbody: {{innerHTML: ""}}, setfoot: {{innerHTML: ""}}, setsheet: {{showModal() {{}}}}}};
-const $ = id => els[id], markView = () => {{}};  // the page's address has no part here (#94)
-const asked = [];
-globalThis.get = async path => {{ asked.push(path); return {{machine: "server", why: "not installed"}}; }};
-openSettings("website"); await new Promise(resolve => setTimeout(resolve, 0));
-return {{asked, body: els.setbody.innerHTML}};""")
-        self.assertEqual(result["asked"], ["/projects/website/codex"])
-        self.assertIn("Codex cannot run on server: not installed", result["body"])
-        self.assertEqual(self.run_js(self.line("let setEdit = ") + "".join(self.function(n) for n in ("openSettings", "checkCodex", "drawSettings")) + f"""
-let lastState = {{project_settings: [{json.dumps(ROWS[0])}]}};
-const els = {{setbody: {{innerHTML: ""}}, setfoot: {{innerHTML: ""}}, setsheet: {{showModal() {{}}}}}};
-const $ = id => els[id], markView = () => {{}};  // the page's address has no part here (#94)
-const asked = [];
-globalThis.get = async path => {{ asked.push(path); return null; }};
-openSettings("website"); return asked;"""), [])  # a project on Claude Code asks nothing of Codex
-
-    def test_an_answer_for_a_pop_up_closed_or_set_back_to_claude_is_not_drawn(self):
-        result = self.codex_popup("""
-let release;
-globalThis.get = path => new Promise(resolve => { release = () => resolve({machine: "server", why: "not installed"}); });
-press("worker_cli", "codex"); press("worker_cli", "claude"); release(); await settle();
-return els.setbody.innerHTML;""", [])
-        self.assertNotIn("data-codex-why", result)
-
-    # Review with: Claude Code or Codex, apart from the workers' (#82).
-
-    def review_field(self, html):
-        return html.split('data-draft="worker_cli" data-value="codex"')[-1].split('data-draft="priority"')[0]
-
-    def test_the_pop_up_shows_review_with_claude_code_or_codex_with_the_projects_choice(self):
-        for r, pressed in ((ROWS[0], "claude"), (row("website", reviewer_cli="codex"), "codex")):
-            field = self.review_field(self.body(r))
-            self.assertIn(">Review with<", field)
-            self.assertIn(self.text["en"]["set_review_with_hint"], field)
-            buttons = re.findall(r'data-draft="reviewer_cli" data-value="(\w+)" aria-pressed="(\w+)"[^>]*>([^<]*)<', field)
-            self.assertEqual(buttons, [("claude", str(pressed == "claude").lower(), "Claude Code"),
-                                       ("codex", str(pressed == "codex").lower(), "Codex")])
-            self.assertNotIn("data-codex-why", field)  # nothing is said before the machine answers
-
-    def test_review_with_reads_in_persian(self):
-        field = self.review_field(self.body(ROWS[0], "fa"))
-        self.assertEqual(self.text["fa"]["set_review_with"], "بازبینی با")
-        for key in ("set_review_with", "set_review_with_hint", "cli_claude", "cli_codex"):
-            self.assertIn(self.text["fa"][key], field, key)
-
-    def test_choosing_codex_reviewers_asks_the_machine_and_says_why_beside_their_switch(self):
-        result = self.codex_popup("""
-press("reviewer_cli", "codex"); await settle();
-const chosen = {asked: [...asked], body: els.setbody.innerHTML, calls: settingsCalls("website", setEdit.was, setEdit.now)};
-press("reviewer_cli", "claude"); await settle();
-return {chosen, back: els.setbody.innerHTML, sent: [...sent]};""", [{"machine": "server", "why": "not installed"}])
-        self.assertEqual(result["chosen"]["asked"], ["/projects/website/codex"])
-        field = self.review_field(result["chosen"]["body"])
-        self.assertIn('data-draft="reviewer_cli" data-value="codex" aria-pressed="true"', field)
-        self.assertIn("data-codex-why>Codex cannot run on server: not installed</div>", field)
-        workers = result["chosen"]["body"].split('data-draft="max_parallel_workers"')[-1].split('data-draft="reviewer_cli"')[0]
-        self.assertNotIn("data-codex-why", workers)  # the workers stay on Claude Code: nothing is said beside them
-        self.assertEqual(result["chosen"]["calls"], [{"setting": "reviewer_cli", "path": "/projects/website/settings?reviewer_cli=codex"}])
-        self.assertNotIn("data-codex-why", result["back"])
-        self.assertEqual(result["sent"], [])  # nothing is saved before Save
-
-    def test_both_on_codex_say_why_beside_each_switch_and_one_set_back_keeps_the_other(self):
-        result = self.codex_popup("""
-press("worker_cli", "codex"); await settle();
-press("reviewer_cli", "codex"); await settle();
-const both = els.setbody.innerHTML;
-press("worker_cli", "claude"); await settle();
-return {both, asked: [...asked], one: els.setbody.innerHTML};""", [{"machine": "server", "why": "not installed"}] * 2)
-        self.assertEqual(result["both"].count("data-codex-why"), 2)
-        self.assertEqual(result["one"].count("data-codex-why"), 1)
-        self.assertIn("data-codex-why", self.review_field(result["one"]))
-
-    def test_a_project_with_codex_reviewers_asks_its_machine_when_its_pop_up_opens(self):
-        result = self.run_js(self.line("let setEdit = ") + "".join(self.function(n) for n in ("openSettings", "checkCodex", "drawSettings")) + f"""
-let lastState = {{project_settings: [{json.dumps(row("website", reviewer_cli="codex"))}]}};
-const els = {{setbody: {{innerHTML: ""}}, setfoot: {{innerHTML: ""}}, setsheet: {{showModal() {{}}}}}};
-const $ = id => els[id], markView = () => {{}};  // the page's address has no part here (#94)
-const asked = [];
-globalThis.get = async path => {{ asked.push(path); return {{machine: "server", why: "not installed"}}; }};
-openSettings("website"); await new Promise(resolve => setTimeout(resolve, 0));
-return {{asked, body: els.setbody.innerHTML}};""")
-        self.assertEqual(result["asked"], ["/projects/website/codex"])
-        self.assertIn("Codex cannot run on server: not installed", self.review_field(result["body"]))
 
     def test_the_models_group_shows_each_role_its_own_model_or_the_global_one_marked_as_global(self):
         html = self.body(ROWS[0])
@@ -398,8 +256,7 @@ return settingsFoot({{was: settingsDraft(r), now: {{...settingsDraft(r), auto_me
         """Opens the website's pop-up and runs `script` in it. `server(path)` answers each call: true, {error} for a
         refusal, or "lost" when the token is no longer taken. `press(key, value)` finds a drawn control of the draft
         and clicks it; `type(value)` types in the daily tokens."""
-        page = "".join(self.function(name) for name in ("openSettings", "checkCodex", "drawSettings", "changeDraft", "saveSettings",
-                                                         "landForRename"))
+        page = "".join(self.function(name) for name in ("openSettings", "drawSettings", "changeDraft", "saveSettings"))
         return self.run_js(self.line("let setEdit = ") + page + f"""
 const markView = () => {{}};  // the page's address, which this pop-up alone has no part in (#94)
 let token ={json.dumps(TOKEN)}, lastState = {{project_settings: {json.dumps(ROWS)}}}, server = () => true;
@@ -616,53 +473,6 @@ typeName("site"); press("frozen"); await saveSettings({}); return {...sheet(), n
             alert = result["body"].split('role="alert">')[1].split("</div>")[0]
             self.assertIn(words, " ".join(re.sub(r"<[^>]+>", " ", alert).split()))
 
-    def test_a_rename_refused_for_running_work_lists_each_one_and_closes_a_free_flight(self):
-        running = [{"kind": "worker", "task": "acme-org/website#12", "since": "2026-11-16T09:30:00+00:00"},
-                   {"kind": "flight", "task": "acme-org/website#14", "since": "2026-11-15T23:11:00+00:00", "key": "t-abc"}]
-        script = f"""
-server = path => path.includes("name=") ? {{error: "stop or wait for the running work first", running: {json.dumps(running)}}} : true;
-typeName("site"); await saveSettings({{}}); const refused = sheet();
-await landForRename({{dataset: {{setLand: "t-abc"}}}}); return {{refused, closed: sheet()}};"""
-        for lang in ("en", "fa"):
-            result = self.popup(script, lang)
-            words = lambda html: " ".join(re.sub(r"<[^>]+>", " ", html.split('role="alert">')[1].split("</div>")[0]).split())
-            listed = words(result["refused"]["body"])
-            self.assertIn("acme-org/website#12", listed)
-            self.assertIn("acme-org/website#14", listed)
-            self.assertIn('data-set-land="t-abc"', result["refused"]["body"])
-            self.assertIn(self.text[lang]["run_close"], listed)
-            self.assertNotIn("{", listed)  # every place in the texts is filled
-            self.assertEqual(result["closed"]["sent"][-1], "/flights/t-abc/close")
-            self.assertNotIn("data-set-land", result["closed"]["body"])  # the closed flight's line goes
-            self.assertIn("acme-org/website#12", words(result["closed"]["body"]))  # the worker is still waited for
-            self.assertTrue(result["closed"]["open"])
-
-    def test_once_the_last_flight_is_closed_the_pop_up_says_to_save_again(self):
-        running = [{"kind": "flight", "task": "acme-org/website#14", "since": "2026-11-15T23:11:00+00:00", "key": "t-abc"}]
-        result = self.popup(f"""
-server = path => path.includes("name=") ? {{error: "stop or wait for the running work first", running: {json.dumps(running)}}}
-  : path.includes("/close") ? {{error: "no such session"}} : true;
-typeName("site"); await saveSettings({{}}); await landForRename({{dataset: {{setLand: "t-abc"}}}}); return sheet();""")
-        alert = " ".join(re.sub(r"<[^>]+>", " ", result["body"].split('role="alert">')[1].split("</div>")[0]).split())
-        self.assertIn(self.text["en"]["run_closed"], alert)  # a flight already gone counts as closed
-        self.assertNotIn("data-set-land", result["body"])
-
-    def test_a_refused_rename_names_the_running_cycle(self):
-        html = self.run_js('return runningList([{kind: "cycle"}]);')
-        self.assertIn(self.text["en"]["run_cycle"], html_text.unescape(html))
-        self.assertEqual(self.run_js("return runningList([]) + runningList();"), "")
-
-    def test_every_look_lists_what_runs_and_closes_a_flight_the_same_way(self):
-        for look in ("classic.html", "classic-new.html"):
-            page = (ROOT / "kandu" / look).read_text(encoding="utf-8")
-            for name in ("runningList", "landForRename"):
-                self.assertIn(self.function(name), page, f"{look}: {name}")
-            self.assertIn('if (hit("set-land")) { landForRename(hit("set-land")); return; }', page, look)
-            self.assertIn("${runningList(r.running)}", page, look)
-            for lang in ("en", "fa"):
-                for key in ("run_cycle", "run_worker", "run_flight", "run_close", "run_close_hint", "run_closed"):
-                    self.assertIn(json.dumps(self.text[lang][key], ensure_ascii=False), page, f"{look}: {lang} {key}")
-
     def test_after_a_rename_the_pop_up_goes_on_under_the_new_name(self):
         result = self.popup("""
 server = path => path.includes("priority") ? {error: "no"} : true;
@@ -772,8 +582,7 @@ sent.length = 0; server = () => true; await saveSettings({}); return {first, aga
                     "set_merge_yes", "set_merge_no", "set_refused", "set_saved", "set_open", "set_danger",
                     "projects_title", "add_a_project", "limit_session", "limit_week", "machines_title", "machine_answers",
                     "machine_silent", "add_machine_short", "kandu_itself", "backup", "switch_drop_blockers",
-                    "switch_requests", "set_name", "set_name_hint", "set_run_with", "set_run_with_hint", "cli_claude",
-                    "cli_codex", "set_codex_why", "set_review_with", "set_review_with_hint"):
+                    "switch_requests", "set_name", "set_name_hint"):
             self.assertIn(key, self.text["en"], key)
             self.assertIn(key, self.text["fa"], key)
 
@@ -801,8 +610,8 @@ class SaveThroughTheApiTest(unittest.TestCase):
         now = {k: v for k, v in was.items() if k != "paused_in_config"} | {
             "paused": True, "max_parallel_workers": was["max_parallel_workers"] + 1, "priority": was["priority"] + 1,
             "daily_token_limit": 300000, "auto_merge": not was["auto_merge"], "frozen": not was["frozen"],
-            "split_approval": "queen", "queen_answers_one_way": not was["queen_answers_one_way"], "worker_cli": "codex",
-            "reviewer_cli": "codex", "model_worker": "claude-haiku-5-5"}
+            "split_approval": "queen", "queen_answers_one_way": not was["queen_answers_one_way"],
+            "model_worker": "claude-haiku-5-5"}
         page = Page()
         script = (page.function("settingsDraft") + page.function("settingsCalls") + page.line("const MODEL_KEYS = ")
                   + page.line("const SETTING_GROUPS = "))
@@ -816,9 +625,7 @@ class SaveThroughTheApiTest(unittest.TestCase):
         changed = {e["setting"]: (e["old"], e["new"]) for e in self.store.events(self.store.today())
                    if e["type"] == "project_setting_changed"}
         self.assertEqual(set(changed), {"priority", "daily_token_limit", "auto_merge", "frozen", "split_approval",
-                                        "queen_answers_one_way", "worker_cli", "reviewer_cli", "model_worker"})
-        self.assertEqual(changed["worker_cli"], ("claude", "codex"))
-        self.assertEqual(changed["reviewer_cli"], ("claude", "codex"))
+                                        "queen_answers_one_way", "model_worker"})
         self.assertEqual(changed["model_worker"], (None, "claude-haiku-5-5"))
         self.assertEqual(changed["priority"], (was["priority"], was["priority"] + 1))
         self.assertEqual(self.store.last_event("parallel_changed")["projects"], {"website": was["max_parallel_workers"] + 1})

@@ -9,7 +9,7 @@ from unittest import mock
 
 from kandu import agents, boards, didban, notify, priority, queen, sizing, split, supervisor
 from kandu.state import StateStore
-from kandu.config import BOARD_COLUMNS, NOTIFY_EVENTS, Board
+from kandu.config import BOARD_COLUMNS, Board
 from kandu.github import GitHub, GitHubError, blockers_in
 from kandu.tasks import TaskError, check_size
 
@@ -159,32 +159,6 @@ class SizingTest(Base):
         self.config.projects[0].split_approval = "queen"
         self.store.set_project_setting(self.config.projects[0].name, "split_approval", "user")
         self.assertEqual(self.large_two_way(), [("split_waits", "the user accepts this project's splits")])
-
-    def told_of_the_proposal(self, queen_on):
-        """What the user hears of the proposal the cycle made, with the queen on or off."""
-        waits = self.store.last_event("decision", task=f"{REPO}#1", decision="split_waits")
-        message = notify.message_for(waits, queen=queen_on)
-        return message and (message.kind, message.text)
-
-    def test_while_the_queen_is_on_a_proposal_she_may_accept_does_not_wait_for_the_user_yet(self):
-        self.config.projects[0].split_approval = "queen"
-        self.large_two_way()
-        self.assertIsNone(self.told_of_the_proposal(queen_on=True))
-
-    def test_the_dashboards_choice_of_the_queen_holds_the_message_too(self):
-        self.store.set_project_setting(self.config.projects[0].name, "split_approval", "queen")
-        self.large_two_way()
-        self.assertIsNone(self.told_of_the_proposal(queen_on=True))
-
-    def test_while_the_queen_is_off_a_proposal_on_her_project_waits_for_the_user(self):
-        self.config.projects[0].split_approval = "queen"
-        self.large_two_way()
-        self.assertEqual(self.told_of_the_proposal(queen_on=False), ("needs_decision", "split"))
-
-    def test_a_proposal_the_user_accepts_waits_for_the_user_with_the_queen_on_or_off(self):
-        self.large_two_way()
-        for queen_on in (True, False):
-            self.assertEqual(self.told_of_the_proposal(queen_on), ("needs_decision", "split"), queen_on)
 
     def test_every_unsized_task_is_sized_in_one_cycle(self):
         for number in range(1, 7):
@@ -900,28 +874,6 @@ class QueenAcceptsSplitTest(Base):
             self.assertIn(name, text)
         self.assertEqual(split.pending(self.store), [])
 
-    def test_her_accept_is_told_only_to_a_user_who_takes_information_messages(self):
-        sent = []
-        adapter = mock.Mock(send=sent.append)
-        self.carry_out(self.accept())
-        accepted = self.store.last_event("queen_accepted_split", task=self.key)
-        without_info = [kind for kind in NOTIFY_EVENTS if kind != "task_done"]
-        notify.Notifier(self.store, adapter, without_info, "en", queen=True).on_event(accepted)
-        self.assertEqual(sent, [])
-        notify.Notifier(self.store, adapter, list(NOTIFY_EVENTS), "en", queen=True).on_event(accepted)
-        self.assertEqual(len(sent), 1)
-        self.assertIn(notify.MESSAGES["en"][notify.FOR_YOUR_INFO], sent[0])
-
-    def test_a_proposal_she_leaves_reaches_the_user_through_her_question(self):
-        refused, _ = self.carry_out({"task": self.key, "action": "ask_user",
-                                     "note": "The second slice is one-way: accept it, or change it in Didban?"})
-        self.assertEqual(refused, [])
-        self.assertEqual(self.github.status(10), "Needs split")
-        self.assertEqual([s["task"] for s in split.pending(self.store)], [self.key])
-        asked = self.store.last_event("queen_decided", task=self.key, action="ask_user")
-        message = notify.message_for(asked, queen=True)
-        self.assertEqual((message.kind, message.text), ("needs_decision", "queen_asks"))
-
     def test_it_goes_through_the_users_yes(self):
         with mock.patch.object(split, "approve", wraps=split.approve) as approve:
             self.carry_out(self.accept())
@@ -989,4 +941,3 @@ class QueenAcceptsSplitTest(Base):
         prompt = self.runner.runs[0].prompt
         self.assertIn("`accept_split`", prompt)
         self.assertIn("never decline or change", prompt)
-        self.assertIn("leave it with an `ask_user`", prompt)

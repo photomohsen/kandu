@@ -427,35 +427,6 @@ class ReadTest(Base):
         self.assertEqual(body["actions"], [{"tool": "Read", "detail": "a.py"}, {"tool": "Bash", "detail": "npm test"}])
         self.assertNotIn("SECRET", json.dumps(body))
 
-    def test_a_codex_runs_steps_show_once_each_and_no_output(self):
-        (self.root / "logs").mkdir()
-        def item(event, **fields):
-            return json.dumps({"type": f"item.{event}", "item": fields})
-        command = dict(id="item_1", type="command_execution", command="npm test", status="in_progress")
-        search = dict(id="item_4", type="web_search", query="codex json events")
-        lines = [json.dumps({"type": "thread.started", "thread_id": "t-1"}),
-                 item("completed", id="item_0", type="agent_message", text="Looking first."),
-                 item("completed", id="item_9", type="reasoning", text="thinking"),
-                 item("started", **command),
-                 item("completed", **command | {"aggregated_output": "SECRET", "exit_code": 0}),
-                 item("started", id="item_2", type="file_change", changes=[{"path": "/w/a.py", "kind": "update"}]),
-                 item("completed", id="item_2", type="file_change",
-                      changes=[{"path": "/w/a.py", "kind": "update"}, {"path": "/w/b.py", "kind": "add"}]),
-                 item("started", id="item_3", type="mcp_tool_call", server="docs", tool="search",
-                      arguments={"q": "x"}),
-                 item("completed", **search),
-                 json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1}}),
-                 "2026-11-17T08:39:01Z ERROR a line on stderr"]
-        (self.root / "logs" / "r-1.jsonl").write_text("\n".join(lines))
-        status, body = self.get("/api/v1/runs/r-1")
-        self.assertEqual(status, 200)
-        self.assertEqual(body["actions"], [{"tool": "Command", "detail": "npm test"},
-                                           {"tool": "Edit", "detail": "/w/a.py"},
-                                           {"tool": "Edit", "detail": "/w/b.py"},
-                                           {"tool": "mcp__docs__search", "detail": ""},
-                                           {"tool": "WebSearch", "detail": "codex json events"}])
-        self.assertNotIn("SECRET", json.dumps(body))
-
     def test_run_id_cannot_leave_the_logs_folder(self):
         self.assertEqual(self.get("/api/v1/runs/..%2F..%2Fsecret")[0], 404)
         self.assertEqual(self.get("/api/v1/runs/r-none")[0], 404)
@@ -668,45 +639,6 @@ class ControlTest(Base):
         self.assertIn("# stop when weekly usage", (self.root / "local" / "kandu.yaml").read_text(encoding="utf-8"))
         self.assertEqual(self.get("/api/v1/state")[1]["limits"], {"session": 85, "week": 40})
         self.assertEqual(self.store.last_event("limits_changed")["week"], 40)
-
-    def on_codex(self):
-        path = self.root / "local" / "projects.yaml"
-        path.write_text(path.read_text(encoding="utf-8").replace("agent_cli: { worker: claude,", "agent_cli: { worker: codex,", 1),
-                        encoding="utf-8")
-        self.api.config = load_config(self.root / "local")
-
-    def test_with_no_project_on_codex_the_state_has_nothing_of_codex(self):
-        self.store.write_current({"supervisor": "asleep", "usage": USAGE, "codex_usage": USAGE})  # left from before
-        state = self.get("/api/v1/state")[1]
-        self.assertNotIn("codex", state)
-        self.assertNotIn("codex_usage", state)
-
-    def test_with_a_project_on_codex_the_state_has_codex_usage_and_limits_beside_claudes(self):
-        self.on_codex()
-        self.store.write_current({"supervisor": "asleep", "usage": USAGE, "codex_usage": {"session": 12, "week": 41}})
-        state = self.get("/api/v1/state")[1]
-        self.assertEqual(state["codex"], {"usage": {"session": 12, "week": 41}, "limits": {"session": 70, "week": 60}})
-        self.assertEqual((state["usage"], state["limits"]), (USAGE, {"session": 70, "week": 60}))
-        self.store.write_current({"supervisor": "asleep", "usage": USAGE})  # Codex not read yet
-        self.assertEqual(self.get("/api/v1/state")[1]["codex"]["usage"], None)
-
-    def test_codex_limits_change_alone_in_the_config(self):
-        self.on_codex()
-        status, body = self.set_limits("?session=55&week=45&cli=codex")
-        self.assertEqual((status, body), (200, {"codex": {"limits": {"session": 55, "week": 45}}}))
-        config = load_config(self.root / "local")
-        self.assertEqual((config.codex_limits().session_5h_percent, config.codex_limits().weekly_percent), (55, 45))
-        self.assertEqual(config.settings.claude.limits.session_5h_percent, 70)
-        state = self.get("/api/v1/state")[1]
-        self.assertEqual((state["codex"]["limits"], state["limits"]), ({"session": 55, "week": 45}, {"session": 70, "week": 60}))
-        self.assertEqual(self.store.last_event("codex_limits_changed")["week"], 45)
-        self.assertIsNone(self.store.last_event("limits_changed"))
-
-    def test_codex_limits_cannot_be_set_while_no_project_uses_codex(self):
-        before = (self.root / "local" / "kandu.yaml").read_text(encoding="utf-8")
-        for query in ("?session=55&week=45&cli=codex", "?session=55&week=45&cli=gemini"):
-            self.assertEqual(self.set_limits(query)[0], 400, query)
-        self.assertEqual((self.root / "local" / "kandu.yaml").read_text(encoding="utf-8"), before)
 
     def test_a_wrong_limit_changes_nothing(self):
         before = (self.root / "local" / "kandu.yaml").read_text(encoding="utf-8")
@@ -955,8 +887,8 @@ class ControlTest(Base):
             {"name": "internal-tool", "paused": True, "paused_in_config": False, "split_approval": "user",
              "queen_answers_one_way": False, "priority": 1}])
         self.assertEqual(set(rows[0]), set(keys) | {"max_parallel_workers", "daily_token_limit", "auto_merge", "frozen",
-                                                   "worker_cli", "reviewer_cli", "multi_user", "model_worker", "model_reviewer",
-                                                   "model_splitter", "model_live_check", "model_bazras", "global_models"})
+                                                         "multi_user", "model_worker", "model_reviewer", "model_splitter",
+                                                         "model_live_check", "model_bazras", "global_models"})
 
     def test_the_split_switch_is_kept_wins_over_the_registry_and_is_logged(self):
         self.api.config.projects[0].split_approval = "queen"

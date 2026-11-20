@@ -4,11 +4,8 @@ The record lives in the PR's comments, so a cycle that is cut off loses nothing.
 Each comment carries a hidden JSON marker. Only comments by Kandu's own account
 count; anyone else on a public repo can write the same text.
 """
-import fnmatch
 import json
 import re
-
-from .config import CLAUDE
 
 REPORT_KEYS = {"head_sha", "summary", "criteria", "earlier", "findings", "checked_ok", "door",
                "blast_radius", "brief", "user_brief", "wait_for_user"}
@@ -167,29 +164,6 @@ def open_after(report, still_open):
     return carried + report["findings"]
 
 
-FORBIDDEN_FINDING = "This PR changes forbidden areas of its project: "
-
-
-def forbidden_areas(forbidden, paths):
-    """The project's forbidden areas that `paths` change, in the registry's order. An area that ends in `/` is a
-    folder; any other is one path, or a pattern such as `*.lock`."""
-    def inside(path, area):
-        return path.startswith(area) if area.endswith("/") else fnmatch.fnmatchcase(path, area)
-    return [area for area in forbidden if any(inside(path, area) for path in paths)]
-
-
-def forbidden_finding(n, areas):
-    """The blocker Kandu itself reports on a PR that changes a forbidden area (DESIGN §9)."""
-    named = ", ".join(f"`{area}`" for area in areas)
-    return {"n": n, "path": "", "line": None, "blocker": True, "criterion": None,
-            "body": f"{FORBIDDEN_FINDING}{named}. Kandu never merges such a PR: take every change to these areas "
-                    "out of the branch, keeping the rest as it is."}
-
-
-def is_forbidden_finding(finding):
-    return finding["path"] == "" and finding["body"].startswith(FORBIDDEN_FINDING)
-
-
 def blockers(findings):
     return [f for f in findings if f["blocker"]]
 
@@ -200,12 +174,11 @@ def _finding_line(finding):
     return f"- **{kind} {finding['n']}** `{place}`: {finding['body']}"
 
 
-def comment_for(report, round_number, findings, second=False, cli=CLAUDE):
-    """Renders one review round: readable text, then the marker the supervisor reads back. A review on another agent
-    CLI than Claude Code names it there (`cli`), so the second review runs on the same one."""
+def comment_for(report, round_number, findings, second=False):
+    """Renders one review round: readable text, then the marker the supervisor reads back."""
     record = {"round": round_number, "second": second, "head_sha": report["head_sha"], "door": report["door"], "open": findings,
               "summary": report["summary"], "brief": report["brief"], "blast_radius": report["blast_radius"],
-              "criteria": report["criteria"], "wait_for_user": report["wait_for_user"]} | ({} if cli == CLAUDE else {"cli": cli})
+              "criteria": report["criteria"], "wait_for_user": report["wait_for_user"]}
     # `>` only occurs inside JSON strings, so this keeps `-->` in a finding from ending the marker.
     marker = json.dumps(record, ensure_ascii=False).replace(">", "\\u003e")
     lines = [f"**Kandu review, round {round_number}** on `{report['head_sha']}`", "", report["brief"], ""]

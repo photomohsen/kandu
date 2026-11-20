@@ -33,8 +33,7 @@ class ToolsTest(unittest.TestCase):
         for given in (None, rules):
             for remote in (False, True):
                 _, denied = agents.worker_tools(project(), "kandu/1-a", given, remote)
-                for tool in ("Bash(git merge *)", "Bash(git pull *)", "Bash(git rebase *)", "Bash(git -C * merge *)",
-                             "Bash(git -C * pull *)", "Bash(git -C * rebase *)", "Bash(gh pr create *)",
+                for tool in ("Bash(git merge *)", "Bash(git pull *)", "Bash(git rebase *)", "Bash(gh pr create *)",
                              "Bash(gh pr edit *)", "Bash(gh pr merge *)"):
                     self.assertIn(tool, denied)
 

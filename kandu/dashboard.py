@@ -20,15 +20,14 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from . import (add, backup, bazras, clean, flights, ghlimit, ghmeter, queen, questions, remove, rename, review, sessions, split,
                tasks, timer, tries, upstream, version, waits)
-from .config import (AGENT_CLIS, CLAUDE, CODEX, DEFAULT_LOCAL_DIR, MODEL, NOTIFY_EVENTS, PACE_SETTINGS, PROJECT_MODEL_ROLES,
-                     REGISTRY_SETTINGS, TECHNICAL_DEBT, ConfigError, Inspect, UsageLimits,
-                     load_config, set_project_model, set_backup, set_clean_merged, set_drop_blockers, set_run_tmp, set_inspect, set_limits, set_pace,
+from .config import (DEFAULT_LOCAL_DIR, NOTIFY_EVENTS, PACE_SETTINGS, PROJECT_MODEL_ROLES, REGISTRY_SETTINGS,
+                     TECHNICAL_DEBT, ConfigError, Inspect, MODEL, load_config, set_project_model, set_backup, set_clean_merged, set_drop_blockers, set_run_tmp, set_inspect, set_limits, set_pace,
                      set_default_look, set_notify_events, set_parallel, set_project_values, set_show_requests,
                      set_telegram_buttons)
 from .github import AGENT_LABEL, GitHubError, task_blockers
 from . import telegram_bot
 from .mirror import FRESH_SECONDS, open_github
-from .runner import DEFAULT_LOGS_DIR, Runner, RunnerError
+from .runner import DEFAULT_LOGS_DIR
 from .state import PROJECT_SETTINGS, StateStore, is_project_setting
 from .tasks import TaskError
 
@@ -42,7 +41,6 @@ TOKEN_ENV = "KANDU_DASHBOARD_TOKEN"
 MAX_BODY = 16384  # a POST's form body; a longer one is refused whole, never cut, as a cut form would save half a command
 BODY_ONLY = ("token", "chat_id")  # secrets a POST takes only from its body, so no URL or log ever holds one
 API = "/api/v1"
-MACHINE_SILENT = "the machine does not answer"  # why Codex cannot be asked about there
 # Every view of the dashboard has its own address: a tab, then what is open over it, as the page reads it. Each answers
 # with the page, so a reload, Back and Forward or a copied link open the same view; what it names is the page's to find.
 VIEW_TABS = ("today", "tasks", "bazras", "settings", "days", "activity", "meadow", "work")  # the Classic looks' own names last
@@ -247,32 +245,12 @@ def flower_marks(store):
     return marks
 
 
-def _codex_actions(item):
-    """The steps in one item of a Codex run, each with the item's id: an item comes once started and again done.
-    Its messages, its reasoning and every step's output stay out."""
-    kind, key = item.get("type"), item.get("id")
-    if kind == "command_execution":
-        steps = [("Command", item.get("command"))]
-    elif kind == "file_change":
-        steps = [("Edit", change.get("path")) for change in item.get("changes") or [] if isinstance(change, dict)]
-    elif kind == "web_search":
-        steps = [("WebSearch", item.get("query"))]
-    elif kind == "mcp_tool_call":
-        steps = [(f"mcp__{item.get('server', '')}__{item.get('tool', '')}", "")]
-    else:
-        steps = []
-    return [{"tool": tool, "detail": str(detail or "")[:MAX_DETAIL], "id": key} for tool, detail in steps]
-
-
 def actions_in(line):
-    """Takes one line of a run's log, from `claude` or `codex`; returns what the agent did in it. Tool results stay
-    out. A Codex step carries its item's `id`, as it comes twice (`run_actions`)."""
+    """Takes one `stream-json` line; returns what the agent did in it. Tool results stay out."""
     try:
         event = json.loads(line)
     except json.JSONDecodeError:
         return []
-    if isinstance(event, dict) and event.get("type") in ("item.started", "item.completed"):
-        return _codex_actions(event["item"]) if isinstance(event.get("item"), dict) else []
     message = event.get("message") if isinstance(event, dict) and event.get("type") == "assistant" else None
     content = message.get("content") if isinstance(message, dict) else None
     actions = []
@@ -281,20 +259,6 @@ def actions_in(line):
             tool_input = part.get("input") if isinstance(part.get("input"), dict) else {}
             detail = next((str(tool_input[k]) for k in TOOL_DETAIL_KEYS if k in tool_input), "")
             actions.append({"tool": part.get("name", ""), "detail": detail[:MAX_DETAIL]})
-    return actions
-
-
-def run_actions(lines):
-    """What a run did, from its log's lines, each step once."""
-    seen, actions = set(), []
-    for line in lines:
-        for action in actions_in(line):
-            key = action.pop("id", None)
-            if key is not None:
-                if (key, action["tool"], action["detail"]) in seen:
-                    continue
-                seen.add((key, action["tool"], action["detail"]))
-            actions.append(action)
     return actions
 
 
@@ -321,9 +285,8 @@ class ApiError(Exception):
 class Api:
     def __init__(self, config, store, github, logs_dir, token=None, clock=time.monotonic, start_cycle=timer.start_cycle,
                  local_dir=DEFAULT_LOCAL_DIR, timer_on=timer.timer_on, flights_=None, restart=timer.restart,
-                 backup_timer=timer.enable_backup, install_dir=upstream.INSTALL_DIR, gate=None, runner=None, release=None):
+                 backup_timer=timer.enable_backup, install_dir=upstream.INSTALL_DIR, gate=None, release=None):
         self.config = config
-        self.runner = runner  # asks a machine whether Codex can run there; a new Runner each time when not given
         self.gate = gate or ghlimit.GATE
         self.store = store
         self.github = github
@@ -354,30 +317,26 @@ class Api:
     def refresh_config(self):
         """Takes a changed config without a restart, so a new project shows in its own patch.
 
-        A config with a problem leaves the last good one in place; `python -m kandu.config` names the problem. The
-        agent CLI the dashboard chose for a project's workers or reviewers is put in its `agent_cli` on each request.
+        A config with a problem leaves the last good one in place; `python -m kandu.config` names the problem.
         """
         with self._config_lock:
             stamp = config_stamp(self.local_dir)
-            if stamp != self._config_stamp:
-                self._config_stamp = stamp
-                try:
-                    config = load_config(self.local_dir)
-                except ConfigError:
-                    config = None
-                if config is not None:
-                    self.config = config
-                    self.flights.config = config
-                    self._queue_time = None  # a new project's tasks need a new read
-            self.store.choose_agent_clis(self.config.projects)  # the dashboard's choice wins over the registry's
+            if stamp == self._config_stamp:
+                return
+            self._config_stamp = stamp
+            try:
+                config = load_config(self.local_dir)
+            except ConfigError:
+                return
+            self.config = config
+            self.flights.config = config
+            self._queue_time = None  # a new project's tasks need a new read
 
     def state(self, query):
         limits = self.config.settings.claude.limits
         marks = self._open_marks(flower_marks(self.store))
         tokens = self._project_tokens()
-        current = self.store.read_current()
-        codex_usage = current.pop("codex_usage", None)
-        return current | self._codex(codex_usage) | {
+        return self.store.read_current() | {
             "timer_on": self.timer_on(),
             "stop_requested": self.store.stop_file.exists(),
             "stopping": self.store.stopping(),  # bees still finishing their step after a stop
@@ -901,7 +860,7 @@ class Api:
         if not RUN_ID.fullmatch(run_id) or not path.exists():
             raise ApiError(404, "no such run")
         with open(path, encoding="utf-8", errors="replace") as log:
-            return {"run_id": run_id, "actions": run_actions(log)}
+            return {"run_id": run_id, "actions": [a for line in log for a in actions_in(line)]}
 
     def reviews(self, query, owner, repo, number):
         full = f"{owner}/{repo}"
@@ -1305,30 +1264,15 @@ class Api:
         self.store.record("wake_requested")
         return {"cycle_started": True}
 
-    def _codex(self, usage):
-        """Codex's usage, as the supervisor last read it, and its limits: only while a project uses Codex."""
-        if not self.config.uses_codex():
-            return {}
-        limits = self.config.codex_limits()
-        return {"codex": {"usage": usage, "limits": {"session": limits.session_5h_percent, "week": limits.weekly_percent}}}
-
     def change_limits(self, query):
-        """Reaches the next cycle through `kandu.yaml`; a cycle already running keeps the limits it read. `cli=codex`
-        sets Codex's own, while a project uses Codex."""
-        cli = query.get("cli", [CLAUDE])[0]
-        if cli not in AGENT_CLIS or (cli == CODEX and not self.config.uses_codex()):
-            raise ApiError(400, "cli: claude, or codex while a project uses it")
+        """Reaches the next cycle through `kandu.yaml`; a cycle already running keeps the limits it read."""
         try:
             session, week = int(query["session"][0]), int(query["week"][0])
-            set_limits(session, week, self.local_dir, cli)
+            set_limits(session, week, self.local_dir)
         except (KeyError, ValueError):
             raise ApiError(400, "give both limits, as whole percents") from None
         except ConfigError as e:
             raise ApiError(400, e.problems[0]) from None
-        if cli == CODEX:
-            self.config.settings.codex.limits = UsageLimits(session, week)
-            self.store.record("codex_limits_changed", session=session, week=week)
-            return {"codex": {"limits": {"session": session, "week": week}}}
         limits = self.config.settings.claude.limits
         limits.session_5h_percent, limits.weekly_percent = session, week
         self.store.record("limits_changed", session=session, week=week)
@@ -1400,17 +1344,6 @@ class Api:
                 | {"global_models": {role: self.config.settings.claude.models.get(role, "") for role in PROJECT_MODEL_ROLES}}
                 for p in self.config.projects]
 
-    def codex_on(self, query, name):
-        """Whether Codex can run this project's workers or reviewers on its machine, asked as the doctor asks it: `why` is the
-        doctor's reason when it cannot, or null. It costs no tokens and changes nothing."""
-        project = self._project(name)
-        runner = self.runner or Runner(self.config)
-        try:
-            why = runner.codex_login(project.machine)
-        except RunnerError:
-            why = MACHINE_SILENT
-        return {"machine": project.machine, "why": why}
-
     @staticmethod
     def _read_value(kind, setting, text):
         if kind is bool:
@@ -1425,11 +1358,10 @@ class Api:
     def change_project_settings(self, query, name):
         """Changes a project's settings. Each change is logged.
 
-        `split_approval`, `queen_answers_one_way`, `worker_cli` and `reviewer_cli` are kept in Kandu's state, where they
-        win over the registry; proposals already accepted, splits already made and workers or reviews already running
-        stay as they are.
-        `priority`, `daily_token_limit`, `auto_merge` and `frozen` are written in its entry in `projects.yaml`, and
-        the next cycle uses them. Nothing is changed if any value is wrong.
+        `split_approval` and `queen_answers_one_way` are kept in Kandu's state, where they win over the registry;
+        proposals already accepted and splits already made stay as they are. `priority`, `daily_token_limit`,
+        `auto_merge` and `frozen` are written in its entry in `projects.yaml`, and the next cycle uses them. Nothing
+        is changed if any value is wrong.
 
         `model_ROLE` names the model ROLE runs on for this project, in its entry's `models`; `model_ROLE=global`
         takes it out, so the role runs on `claude.models` again. The next run uses it; a run at work keeps its model.
@@ -1493,8 +1425,7 @@ class Api:
             with self._add_lock:
                 result = rename.rename_project(project.name, given["name"], self.store, self.local_dir)
         except rename.RenameError as e:
-            running = {"running": e.running} if e.running else None  # what to wait for or close, for the page to list
-            raise ApiError(409 if str(e) == rename.RUNNING else 400, str(e), running) from None
+            raise ApiError(409 if str(e) == rename.RUNNING else 400, str(e)) from None
         except ConfigError as e:
             raise ApiError(400, e.problems[0]) from None
         finally:
@@ -1595,7 +1526,6 @@ ROUTES = [
     ("POST", "/projects/{name}/resume", Api.resume_project),
     ("POST", "/projects/{name}/inspect", Api.change_inspect),
     ("POST", "/projects/{name}/settings", Api.change_project_settings),
-    ("GET", "/projects/{name}/codex", Api.codex_on),
     ("POST", "/projects/{name}/remove", Api.remove_project),
     ("POST", "/backup", Api.change_backup),
     ("POST", "/upstream/check", Api.check_upstream),

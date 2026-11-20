@@ -9,20 +9,15 @@ import unittest
 from kandu import dashboard
 from tests.test_dashboard import TOKEN
 from tests.test_looks import NODE, ROOT, Served, browser, function, line, read, run_js, words
-from tests.test_worker_cli import FakeRunner
 
 CLEAN = read(dashboard.PAGE)
 FUNCTIONS = ("settingsDraft", "settingsCalls", "mergeOnAsked", "saveStep", "applySettings", "settingControl", "settingsBody",
-             "settingsFoot", "openSettings", "checkCodex", "drawSettings", "changeDraft", "saveSettings", "closeSettings")
+             "settingsFoot", "openSettings", "drawSettings", "changeDraft", "saveSettings", "closeSettings")
 KEYS = ("set_group_models", "set_model_own", "set_model_global", "set_model_from_global", "set_model_same",
         "set_model_default", "set_model_worker", "set_model_reviewer", "set_model_splitter", "set_model_live_check",
         "set_model_bazras", "set_open", "set_open_hint", "set_group_work", "set_group_merge", "set_group_queen", "set_name", "set_name_hint",
         "set_run_label", "set_running", "set_me", "set_the_queen", "set_split_by", "set_one_way_by", "set_refused",
-        "set_danger", "set_merge_ask", "set_merge_no", "set_merge_yes", "set_saved", "set_run_with", "set_run_with_hint",
-        "cli_claude", "cli_codex", "set_codex_why", "set_review_with", "set_review_with_hint")
-# The doctor's reasons, which the page puts in Persian beside the Run with switch (#81).
-CODEX_REASONS = ("not installed", "not logged in; run: codex login", "codex login status did not answer",
-                 "the machine does not answer")
+        "set_danger", "set_merge_ask", "set_merge_no", "set_merge_yes", "set_saved")
 
 
 class ClassicSettingsPopupTest(unittest.TestCase):
@@ -60,8 +55,6 @@ class ClassicSettingsPopupTest(unittest.TestCase):
                 if key != "set_open_hint":
                     self.assertEqual(self.text[lang][key], clean[lang][key], f"{lang}: {key}")
         self.assertIn("give the project a name", self.text["values_fa"])
-        for why in CODEX_REASONS:
-            self.assertEqual(self.text["values_fa"][why], clean["values_fa"][why], why)
 
     def test_a_removed_project_closes_its_pop_up(self):
         self.assertIn("closeSettings(name);", function(self.page, "removeProject"))
@@ -79,45 +72,21 @@ class ClassicSettingsPopupTest(unittest.TestCase):
                                  "/projects/website/settings?name=site"])
 
 
-class ClassicNewSettingsPopupTest(unittest.TestCase):
-    """The Classic new look's pop-up is Kandu Clean's too, Run with among its settings (#81)."""
-    def setUp(self):
-        self.page = read(dashboard.CLASSIC_NEW_PAGE)
-
-    def test_its_code_and_words_are_the_kandu_clean_looks(self):
-        for name in FUNCTIONS:
-            classic, clean = function(self.page, name), function(CLEAN, name)
-            if name == "settingControl":
-                clean = clean.replace('class="switch" role="switch"', 'class="flip" role="switch"')
-            self.assertEqual(classic, clean, name)
-        for start in ("const SETTING_GROUPS = ", "const SETTING_LABELS = ", "const SETTING_HINTS = "):
-            self.assertEqual(line(self.page, start), line(CLEAN, start), start)
-        text, clean = words(self.page), words(CLEAN)
-        for lang in ("en", "fa"):
-            for key in ("set_run_with", "set_run_with_hint", "cli_claude", "cli_codex", "set_codex_why", "set_review_with",
-                        "set_review_with_hint"):
-                self.assertEqual(text[lang][key], clean[lang][key], f"{lang}: {key}")
-        for why in CODEX_REASONS:
-            self.assertEqual(text["values_fa"][why], clean["values_fa"][why], why)
-
-
 @unittest.skipUnless(NODE and browser(), "needs node and a Chromium to open the pages")
 class ClassicSettingsBrowserTest(Served):
     CASES = [{"lang": "en", "width": 1280, "height": 900, "mobile": False}, {"lang": "fa", "width": 1280, "height": 900, "mobile": False},
              {"lang": "en", "width": 390, "height": 844, "mobile": True}, {"lang": "fa", "width": 390, "height": 844, "mobile": True}]
 
     def test_a_click_on_a_project_name_opens_its_settings_over_the_same_page_and_save_changes_them(self):
-        self.api.runner = FakeRunner({"server": "not installed", "laptop": None})  # the website's machine has no Codex
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as profile:
             done = subprocess.run([NODE, str(ROOT / "tests" / "drive_classic_settings.js"), browser(), self.base, profile, TOKEN,
                                    json.dumps(self.CASES)], capture_output=True, text=True, timeout=180)
         self.assertEqual(done.returncode, 0, done.stderr[-3000:])
         report = json.loads(done.stdout)
         self.assertEqual(report["errors"], [])
-        every = ["name", "paused", "max_parallel_workers", "worker_cli", "reviewer_cli", "priority", "daily_token_limit", "multi_user",
-                 "auto_merge", "frozen", "split_approval", "queen_answers_one_way", "model_worker", "model_reviewer", "model_splitter",
-                 "model_live_check", "model_bazras"]
-        text = words(read(dashboard.CLASSIC_PAGE))
+        every = ["name", "paused", "max_parallel_workers", "priority", "daily_token_limit", "multi_user", "auto_merge", "frozen",
+                 "split_approval", "queen_answers_one_way", "model_worker", "model_reviewer", "model_splitter", "model_live_check",
+                 "model_bazras"]
         for case in report["results"]:
             name, steps = f'{case["lang"]} at {case["width"]}px', case["steps"]
             self.assertEqual(steps["look"], "classic", name)
@@ -135,41 +104,7 @@ class ClassicSettingsBrowserTest(Served):
             before = steps["priority"]["before"]
             self.assertEqual(steps["priority"], {"before": before, "unsaved": before, "after": before + 1}, name)
             self.assertIn("website", steps["toast"], name)
-            lang = case["lang"]
-            why = "not installed" if lang == "en" else text["values_fa"]["not installed"]
-            self.assertEqual(steps["codex"], {"why": text[lang]["set_codex_why"].replace("{machine}", "server").replace("{why}", why),
-                                              "beside": True, "saved": "codex"}, name)
-            self.assertEqual(steps["review"], {"why": text[lang]["set_codex_why"].replace("{machine}", "server").replace("{why}", why),
-                                               "sideways": False, "saved": "codex"}, name)
 
-
-
-@unittest.skipUnless(NODE and browser(), "needs node and a Chromium to open the pages")
-class ReviewWithInEveryLookBrowserTest(Served):
-    """«Review with» in each look's pop-up, in English and Persian, on a wide screen and a phone (#82)."""
-    PAGES = {"classic": dashboard.CLASSIC_PAGE, "classic-new": dashboard.CLASSIC_NEW_PAGE, "clean": dashboard.PAGE}
-    CASES = [{"look": look, "lang": lang, "width": width, "height": height, "mobile": width < 600}
-             for look in PAGES for lang in ("en", "fa") for width, height in ((1280, 900), (390, 844))]
-
-    def test_codex_reviewers_are_chosen_and_saved_with_the_doctors_reason_beside_their_switch(self):
-        self.api.runner = FakeRunner({"server": "not installed", "laptop": None})  # the website's machine has no Codex
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as profile:
-            done = subprocess.run([NODE, str(ROOT / "tests" / "drive_review_with.js"), browser(), self.base, profile, TOKEN,
-                                   json.dumps(self.CASES)], capture_output=True, text=True, timeout=240)
-        self.assertEqual(done.returncode, 0, done.stderr[-3000:])
-        report = json.loads(done.stdout)
-        self.assertEqual(report["errors"], [])
-        self.assertEqual(len(report["results"]), len(self.CASES))
-        for case in report["results"]:
-            look, lang = case["look"], case["lang"]
-            name, steps, text = f"{look}, {lang} at {case['width']}px", case["steps"], words(read(self.PAGES[look]))
-            why = "not installed" if lang == "en" else text["values_fa"]["not installed"]
-            self.assertEqual(steps["look"], look, name)
-            self.assertTrue(steps["open"] and steps["asked"] and steps["closed"], name)
-            self.assertEqual(steps["label"], text[lang]["set_review_with"], name)
-            self.assertEqual(steps["shown"], {"why": text[lang]["set_codex_why"].replace("{machine}", "server").replace("{why}", why),
-                                              "workers": False, "pressed": "codex", "sideways": False}, name)
-            self.assertEqual(steps["saved"], {"worker_cli": "claude", "reviewer_cli": "codex"}, name)
 
 if __name__ == "__main__":
     unittest.main()

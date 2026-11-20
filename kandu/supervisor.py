@@ -26,12 +26,12 @@ from .config import DEFAULT_LOCAL_DIR, TECHNICAL_DEBT, ConfigError, load_config
 from .flights import Flights
 from .github import BREAKING_LABEL, TOKENS_LABEL, GitHubError, blockers_in, branch_for, task_blockers, transient
 from .mirror import open_github
-from .notify import CHECK_NOT_RUN, LIVE_DOWN, QUEEN_MAY_ACCEPT, TESTS_FAIL_IN, notifier_for
-from .runner import CLAUDE, CODEX, DEFAULT_LOGS_DIR, LocalWork, Runner, RunnerError, Unreachable
+from .notify import CHECK_NOT_RUN, LIVE_DOWN, TESTS_FAIL_IN, notifier_for
+from .runner import DEFAULT_LOGS_DIR, LocalWork, Runner, RunnerError, Unreachable
 from .state import StateStore
 from .tasks import TaskError
 from .tries import FAILURE_COMMENT, INTERNAL_TRIES, SIZING_FAILURE_COMMENT, count as count_tries
-from .usage import UsageError, over_limit, read_codex_usage, read_usage
+from .usage import UsageError, over_limit, read_usage
 
 BACKLOG, READY, IN_PROGRESS, IN_REVIEW = "Backlog", "Ready", "In progress", "In review"
 NEEDS_INFO, BLOCKED, DONE = "Needs info", "Blocked", "Done"
@@ -43,7 +43,6 @@ LANDING_FAILED = ("deploy_failed", "live_check_failed")
 BROKEN_REPLY = (agents.ReplyError, review.ReportError, split.ReportError)
 BASE_MOVED = "Base branch was modified"  # another merge landed first; GitHub asks to try once more
 MERGE_TRIES = 3  # Kandu's own trouble is tried this often in a row before the task stops for a look.
-CHECKOUT_TRIES = 2  # a Codex review that changed its checkout runs once more; the second time the task stops
 MERGE_RETRY_WAITS = (10, 30, 60)  # seconds before each quick new try of a merge GitHub refused for a moment
 MERGE_RETRY_EVERY = 60  # then one try about this often, until the cycle ends
 RETRY_POLL_SECONDS = 5  # how often a wait for the next try looks for a stop or a yes
@@ -226,20 +225,17 @@ def _at_work(item, events, github):
 
 class Supervisor:
     def __init__(self, config, store, github, runner, usage_reader, local_dir=DEFAULT_LOCAL_DIR, now=None,
-                 sleep=time.sleep, flights=None, codex_reader=read_codex_usage):
+                 sleep=time.sleep, flights=None):
         self.config = config
         self.flights = flights or Flights(config, store)  # the free flights, which the merge cleanup may end
         self.store = store
         self.github = github
         self.runner = runner
         self.usage_reader = usage_reader
-        self.codex_reader = codex_reader
         self.local_dir = local_dir
         self.now = now or (lambda: datetime.now().astimezone())
         self.deadline = None
         self.usage = None
-        self.codex_usage = None
-        self.usage_held = {}  # agent CLI -> why its runs wait this cycle: its usage limit, or its usage unread
         self.halt_reason = None
         self.queen_trouble = None
         self.queen_run = None
@@ -254,7 +250,6 @@ class Supervisor:
         self.sleep = sleep
         self.next_wake = None
         self._lock = threading.Lock()
-        self._codex_lock = threading.Lock()
         self._deploy_locks = defaultdict(threading.Lock)
 
     def _is_paused(self, project):
@@ -335,32 +330,16 @@ class Supervisor:
         """True while the user has Kandu stopped: no new run, merge or deploy starts. A resume undoes it at once."""
         return self.stop_file.exists()
 
-    def _time_up(self):
-        """Returns "cycle time is up" once the cycle's time is over, or None. It holds every agent CLI."""
-        if self.deadline is not None and self.now() >= self.deadline:
-            return "cycle time is up"
-        return None
-
     def _gate(self):
-        """Returns why no Claude agent may start now, or None."""
+        """Returns why no agent may start now, or None."""
         if self._stopping():
             return STOPPED_BY_USER
-        return self._time_up() or self._usage_limit(CLAUDE)
+        return self._limit()
 
-    def _usage_limit(self, cli):
-        """Why no run of `cli` may start now for its own usage, or None: each agent CLI has its own limits, and
-        is held by nothing of the other's. While a project uses Codex, a held CLI stays held for the rest of the
-        cycle; without one, every run reads Claude's usage again, as it always has."""
-        with self._lock:
-            if cli in self.usage_held:
-                return self.usage_held[cli]
-        reason = self._read_codex() if cli == CODEX else self._read_claude()
-        if reason is not None and self.config.uses_codex():
-            with self._lock:
-                self.usage_held.setdefault(cli, reason)
-        return reason
-
-    def _read_claude(self):
+    def _limit(self):
+        """Returns which limit holds every agent back now, or None: the cycle's time or the usage."""
+        if self.deadline is not None and self.now() >= self.deadline:
+            return "cycle time is up"
         if self.config.settings.claude.auth == "api_key":
             return None
         try:
@@ -368,38 +347,6 @@ class Supervisor:
         except UsageError as e:
             return f"usage unknown, not starting: {e}"
         return over_limit(self.usage, self.config.settings.claude.limits)
-
-    def _read_codex(self):
-        try:
-            self.codex_usage = self.codex_reader()
-        except UsageError as e:
-            self._codex_readable(False, str(e))
-            return f"Codex usage unknown, not starting: {e}"
-        self._codex_readable(True)
-        return over_limit(self.codex_usage, self.config.codex_limits(), "Codex ")
-
-    def _codex_readable(self, readable, reason=""):
-        """Records each change between Codex's usage read and not read, so the user hears once of each time it
-        cannot be read, as for Claude."""
-        with self._codex_lock:
-            last = self.store.last_event("codex_usage_read")
-            if last is None or last["readable"] != readable:
-                self.store.record("codex_usage_read", readable=readable, reason=reason)
-
-    def _wait_for_usage(self, cli):
-        """Ends this turn when a limit holds `cli`. The cycle's end halts every run. A usage limit holds only the
-        runs of its own agent CLI: the task waits for a later cycle and the rest go on. With no project on Codex
-        every run is Claude's, so Claude's limit halts the cycle, as it always has. A stop is not a limit: the
-        caller checks it (`_stopping`), so a run that ends after Stop is judged as any other."""
-        reason = self._time_up()
-        if reason is not None:
-            self._halt(reason)
-        reason = self._usage_limit(cli)
-        if reason is None:
-            return
-        if cli == CLAUDE and not self.config.uses_codex():
-            self._halt(reason)
-        raise CycleStop(reason)
 
     def _halt(self, reason):
         with self._lock:
@@ -409,13 +356,15 @@ class Supervisor:
     # The dashboard's snapshot.
 
     def _snapshot(self, supervisor, reason=None, next_wake=None):
+        usage = self.usage and {"session": self.usage.session, "week": self.usage.week,
+                                "session_resets": self.usage.session_resets, "week_resets": self.usage.week_resets}
         with self._lock:
             self.store.write_current({
-                "supervisor": supervisor, "last_reason": reason, "next_wake": next_wake, "usage": _usage_view(self.usage),
+                "supervisor": supervisor, "last_reason": reason, "next_wake": next_wake, "usage": usage,
                 "workers": list(self.workers.values()), "waiting_for_machine": self.waiting,
                 "unreachable_machines": self.unreachable,
                 "queen_run": self.queen_run,
-            } | ({"codex_usage": _usage_view(self.codex_usage)} if self.config.uses_codex() else {}))
+            })
 
     def _phase(self, task, phase):
         self.store.record("phase_changed", task=task.key, project=task.project.name, phase=phase)
@@ -480,48 +429,22 @@ class Supervisor:
             return None
         return lambda repo, number: show.render(self.github.item(repo, number))
 
-    def _cli(self, project, role):
-        """The agent CLI that runs `role` for `project`: Claude Code unless its `agent_cli` names another. The
-        dashboard's choice is read again each time, so a change reaches the next run that starts, never one running."""
-        self.store.choose_agent_clis([project])
-        return project.agent_cli.get(role, CLAUDE)
-
-    def _codex_may_have_worked(self, project):
-        """Codex runs this project's workers, or ran one before the dashboard switched it back to Claude Code: what a
-        Codex worker changed stays in its PR, whoever works on it after."""
-        chosen = "worker_cli" in self.store.project_settings().get(project.name, {})
-        return self._cli(project, "worker") == CODEX or chosen
-
-    def _codex_ready(self, task):
-        """Ends this turn when Codex is missing or logged out on the task's machine: no Codex run starts there. It is
-        not the task's fault, so the task goes on in a later cycle; the doctor names the machine and the cause."""
-        machine = task.project.machine
-        why = self.runner.codex_login(machine)
-        if why is not None:
-            self._decide(task, "codex_unavailable", f"Codex on {machine}: {why}")
-            raise CycleStop(f"Codex on {machine}: {why}")
-
-    def _agent(self, task, role, cwd, prompt, tools, run_id, tokens=None, schema=None, resume=None, cli=CLAUDE,
-               temp_files=False):
-        """Runs one agent for `task` with the agent CLI `cli`; Claude Code unless a caller names another.
-        With `temp_files`, a Codex run that may change no file still writes temp files (`Runner.run_agent`)."""
+    def _agent(self, task, role, cwd, prompt, tools, run_id, tokens=None, schema=None, resume=None):
         if self._stopping():
             raise CycleStop(STOPPED_BY_USER)  # not kept for the cycle: a resume lets the rest go on
-        self._wait_for_usage(cli)
+        reason = self._limit()
+        if reason is not None:
+            self._halt(reason)
         if self._is_paused(task.project):
             raise CycleStop
-        if cli == CODEX:
-            self._codex_ready(task)
         allowed, denied = tools
         with self._lock:
             self.workers[task.key]["run_id"] = run_id
         self._snapshot("awake")
         stop_one = self.store.worker_stop_file(run_id)
-        # Claude's model setting is for Claude Code alone: another CLI runs on its own default.
-        model = self._model(role, task.project) if cli == CLAUDE else None
         result = self.runner.run_agent(task.project.machine, cwd, prompt, allowed, denied, run_id,
-                                       lambda: self._hard_stop() or stop_one.exists(), model, tokens,
-                                       schema, resume, cli=cli, temp_files=temp_files)
+                                       lambda: self._hard_stop() or stop_one.exists(), self._model(role, task.project), tokens,
+                                       schema, resume)
         self.store.record("run_finished", task=task.key, project=task.project.name, run_id=run_id, role=role,
                           models=result.models, duration_ms=result.duration_ms, is_error=result.is_error)
         if stop_one.exists():
@@ -529,20 +452,16 @@ class Supervisor:
             raise StoppedByUser(f"{role} run {run_id} was stopped by the user")
         if result.stopped:
             self._halt(CUT_OFF)
-        if result.no_command_started:
-            # Not the task's fault, as when Codex cannot start there at all: nothing it says counts, and the task goes
-            # on in a later cycle.
-            why = f"Codex on {task.project.machine}: {role} run {run_id} could start no command"
-            self._decide(task, "codex_unavailable", why)
-            raise CycleStop(why)
         if result.is_error:
-            self._wait_for_usage(cli)  # A run cut off by a limit is not the task's fault.
+            reason = self._limit()  # A run cut off by a limit is not the task's fault.
+            if reason is not None:
+                self._halt(reason)
             raise KanduTrouble(f"{role} run {run_id} ended with an error")
         return result
 
-    def _reply(self, task, role, cwd, tools, result, read, tokens=None, schema=None, temp_files=False):
+    def _reply(self, task, role, cwd, tools, result, read, tokens=None, schema=None):
         """Returns `read(text)`. A reply it cannot read is asked for once more, in the same session: the work is
-        done, and only its last message is missing. It goes to the CLI that ran it, in the same sandbox."""
+        done, and only its last message is missing."""
         try:
             return read(result.text)
         except BROKEN_REPLY as e:
@@ -550,7 +469,7 @@ class Supervisor:
                 raise
             self._decide(task, "reply_reasked", f"{role}: {e}")
             again = self._agent(task, role, cwd, agents.reask_prompt(e), tools, new_run_id(self.now()), tokens,
-                                schema, resume=result.session_id, cli=result.cli, temp_files=temp_files)
+                                schema, resume=result.session_id)
             return read(again.text)
 
     def _worktree(self, task, base):
@@ -577,8 +496,7 @@ class Supervisor:
         project = task.project
         tokens = (project.secrets_from, list(project.task_tokens)) if task.tokens else None
         tools = agents.worker_tools(project, task.branch, self._rules("worker"), self._remote(project))
-        result = self._agent(task, "worker", cwd, prompt, tools, run_id, tokens, agents.WORKER_SCHEMA,
-                             cli=self._cli(project, "worker"))
+        result = self._agent(task, "worker", cwd, prompt, tools, run_id, tokens, agents.WORKER_SCHEMA)
         read = agents.parse_worker_reply if pr is not None else agents.parse_first_reply
         return self._reply(task, "worker", cwd, tools, result, read, tokens, agents.WORKER_SCHEMA)
 
@@ -692,9 +610,8 @@ class Supervisor:
         self._phase(task, f"review round {round_number}")
         to_fix = self._to_fix(task, reviews[-1]) if reviews else []
         language = self.config.settings.language
-        # Every review, a second one too, runs on the project's choice as it stands: a switch away from a CLI that
-        # cannot review on this machine reaches the next round, and the earlier findings carry over whoever wrote them.
-        cli = self._cli(task.project, "reviewer")
+        run_id = new_run_id(self.now())
+        cwd = self.runner.prepare_review(task.project, task.repo, task.branch, head)
         if to_fix:
             prompt = agents.second_review_prompt(task.repo, task.number, pr["number"], head, language, to_fix,
                                                  self.github.default_branch(task.repo), self._copy(task.project))
@@ -705,33 +622,17 @@ class Supervisor:
             prompt = agents.reviewer_prompt(task.project, task.repo, task.number, pr["number"], head, language,
                                             companions, criteria, first_n, self.github.default_branch(task.repo),
                                             local_dir=self.local_dir, copy=self._copy(task.project))
-        tools = agents.reviewer_tools(task.project, self._rules("reviewer"), self._remote(task.project), cli)
-        # A Codex reviewer may write temp files to run the tests, so code checks it left its checkout as it was.
-        codex = cli == CODEX
+        tools = agents.reviewer_tools(task.project, self._rules("reviewer"), self._remote(task.project))
+        result = self._agent(task, "reviewer", cwd, prompt, tools, run_id, schema=review.REPORT_SCHEMA)
+
         stale = []
 
         def read(text):
             report = review.parse_report(text)
             stale[:] = review.validate_report(report, to_fix, second=bool(to_fix))
             return report
-        for _ in range(CHECKOUT_TRIES):
-            run_id = new_run_id(self.now())
-            cwd = self.runner.prepare_review(task.project, task.repo, task.branch, head)  # back to the head as pushed
-            result = self._agent(task, "reviewer", cwd, prompt, tools, run_id, schema=review.REPORT_SCHEMA, cli=cli,
-                                 temp_files=codex)
-            try:
-                report = self._reply(task, "reviewer", cwd, tools, result, read, schema=review.REPORT_SCHEMA,
-                                     temp_files=codex)
-            except review.ReportError as e:
-                raise KanduTrouble(f"reviewer run {run_id}: {e}") from e
-            changed = self.runner.checkout_changed(task.project, cwd, head) if codex else None
-            if changed is None:
-                break
-            # Not posted: a review counts only for the head as it was pushed.
-            self._decide(task, "review_changed_checkout", f"reviewer run {run_id}: {changed}")
-        else:
-            raise TaskFailed(f"the Codex review changed its checkout {CHECKOUT_TRIES} times: {changed}")
         try:
+            report = self._reply(task, "reviewer", cwd, tools, result, read, schema=review.REPORT_SCHEMA)
             dropped = (review.carry_over(report, reviews[-1], to_fix) if to_fix else
                        review.hold_to_scope(report, criteria, [f["path"] for f in pr["files"]]))
         except review.ReportError as e:
@@ -744,31 +645,14 @@ class Supervisor:
                          f"{len(stale)} results for findings no longer open: {[e.get('n') if isinstance(e, dict) else e for e in stale]}")
         if dropped:
             self._decide(task, "findings_dropped", f"{dropped} outside what this review may report")
-        findings = self._forbidden_changed(task, cwd, head, review.open_after(report, to_fix), reviews)
+        findings = review.open_after(report, to_fix)
         self.github.comment_pr(task.repo, pr["number"],
-                               review.comment_for(report, round_number, findings, second=bool(to_fix), cli=cli))
+                               review.comment_for(report, round_number, findings, second=bool(to_fix)))
         self.store.record("review_finished", task=task.key, project=task.project.name, run_id=run_id,
                           round=round_number, head_sha=head, findings=len(findings),
                           blockers=len(review.blockers(findings)), door=report["door"],
                           criteria_met=all(c["result"] == "met" for c in report["criteria"]),
                           wait_for_user=report["wait_for_user"], user_brief=report["user_brief"])
-
-    def _forbidden_changed(self, task, cwd, head, findings, reviews):
-        """Codex cannot be denied single folders, so code reads what a Codex worker's PR changed. A forbidden area it
-        changed is Kandu's own blocker, naming the areas: the task goes back to a fix round, and the PR never merges
-        while it is open. Code alone opens and closes it, on each reviewed head."""
-        project = task.project
-        if not project.forbidden or not self._codex_may_have_worked(project):
-            return findings
-        paths = self.runner.changed_paths(project, task.repo, cwd, self.github.default_branch(task.repo), head)
-        areas = review.forbidden_areas(project.forbidden, paths)
-        kept = [f for f in findings if not review.is_forbidden_finding(f)]
-        if not areas:
-            return kept
-        earlier = [f["n"] for f in findings if review.is_forbidden_finding(f)]
-        used = [f["n"] for r in reviews for f in r["open"]] + [f["n"] for f in findings]
-        self._decide(task, "forbidden_changed", ", ".join(areas))
-        return kept + [review.forbidden_finding(earlier[0] if earlier else 1 + max(used, default=0), areas)]
 
     def _sized_notes(self, task, pr, last):
         """The splitter sizes a review's notes once. If it cannot, they must still not hold the PR."""
@@ -1462,7 +1346,8 @@ class Supervisor:
         """Every proposal waits in `Needs split`, also when every slice is two-way: for the user's yes, and on a
         project whose split approval is the queen's, also for hers."""
         approval = self.store.project_setting(task.project, "split_approval")
-        why = "the user accepts this project's splits" if approval == "user" else QUEEN_MAY_ACCEPT
+        why = "the user accepts this project's splits" if approval == "user" \
+            else "the queen may accept it, or leave it for the user"
         self._decide(task, "split_waits", why)
         self.github.comment_issue(task.repo, task.number, f"Kandu sized this {sizing.LARGE}. "
                                   "A proposal to split it waits for the owner.")
@@ -2164,7 +2049,6 @@ class Supervisor:
         self.seen.clear()
         self.waiting_on.clear()
         self.store.carry_settings(self.config.projects)  # before the first snapshot: it tells an install that ran before
-        self.store.choose_agent_clis(self.config.projects)  # the dashboard's choice, before anything asks who uses Codex
         self.store.record("supervisor_woke")
         clean_since = self.store.clean_since(woke)  # set once, on the first cycle that has the cleanup
         self._snapshot("awake")
@@ -2173,15 +2057,10 @@ class Supervisor:
         self.next_wake = (woke + timedelta(minutes=settings.wake_every_minutes)).isoformat(timespec="seconds")
         self.halt_reason = None
         self.queen_trouble = None
-        self.usage_held.clear()
         failed = self.github.refresh(self.config)  # the copy as GitHub holds it now, before anything is decided
         if failed:
             self.store.record("copy_not_read", detail="; ".join(failed))
         reason = self._gate() or self._queen_limit()
-        if self.config.uses_codex():
-            codex = self._usage_limit(CODEX)  # read each cycle, so the dashboard shows it
-            if reason is not None and reason == self.usage_held.get(CLAUDE) and codex is None:
-                reason = None  # Codex's runs may start: Claude's limit holds Claude's runs alone
         if reason is None:
             try:
                 self._close_groups()
@@ -2192,8 +2071,6 @@ class Supervisor:
             except (GitHubError, RunnerError) as e:
                 self.queen_trouble = type(e).__name__
             reason = self._work_through_board()
-            if self.halt_reason is None and reason in ("nothing ready", "tasks ran out", "waiting for a machine"):
-                reason = self.usage_held.get(CLAUDE, reason)  # Claude's runs waited all along: it says so, as ever
         self._tell_open_flights()
         self._clean(clean_since)
         self._watch_machines()
@@ -2241,18 +2118,12 @@ class Supervisor:
 
     def dry_run(self):
         """Shows what a cycle would do. Starts no agent and writes nothing."""
-        self.usage_held.clear()
         reason = self._gate()
         if reason is not None:
             return [f"would sleep: {reason}"]
         tasks = self._board_tasks()
         return [f"{t.key} [{t.status}] on {t.project.machine}: reachable={self.runner.reachable(t.project.machine)}"
                 for t in tasks] or ["would sleep: nothing ready"]
-
-
-def _usage_view(usage):
-    return usage and {"session": usage.session, "week": usage.week,
-                      "session_resets": usage.session_resets, "week_resets": usage.week_resets}
 
 
 def _locked_cycle(supervisor):

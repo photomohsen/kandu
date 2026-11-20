@@ -16,7 +16,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from kandu import agents, notify, queen, questions, review, split, supervisor, tasks
-from kandu.config import Rules, UsageLimits, load_config
+from kandu.config import Rules, load_config
 from kandu.flights import Flights, task_key
 from kandu.notify import Notifier
 from kandu.github import BoardItem, GitHubError, is_breaking
@@ -147,8 +147,7 @@ class FakeGitHub:
         return "main"
 
     def open_pr(self, repo, issue, head=SHA1, state="OPEN"):
-        # Each issue has its own PR number, so two tasks side by side never share one; issue 1 has #7.
-        pr = {"number": 6 + issue, "state": state, "headRefOid": head, "headRefName": f"kandu/{issue}-task", "labels": [],
+        pr = {"number": 7, "state": state, "headRefOid": head, "headRefName": f"kandu/{issue}-task", "labels": [],
               "comments": [], "body": "", "files": [{"path": "a.py"}], "url": "u", "isDraft": False, "mergeable": "MERGEABLE", "statusCheckRollup": []}
         self.prs[(repo, issue)] = pr
         return pr
@@ -216,8 +215,7 @@ class FakeGitHub:
 
 
 class FakeRunner:
-    """Each agent run takes the next step: a text reply, or a function called during the run.
-    A step can be a dict of steps by task, for runs that go side by side: the run takes the one for the task its prompt names."""
+    """Each agent run takes the next step: a text reply, or a function called during the run."""
 
     def __init__(self, github):
         self.github = github
@@ -251,13 +249,6 @@ class FakeRunner:
     def conflict_markers(self, project, repo, directory, branch, paths):
         return [p for p in paths if p in self.markers]
 
-    def changed_paths(self, project, repo, directory, base, head):
-        self.diffs = getattr(self, "diffs", []) + [(directory, base, head)]
-        return getattr(self, "changed", {}).get(head, ["a.py"])
-
-    def codex_login(self, machine):
-        return getattr(self, "codex_out", {}).get(machine)
-
     def branch_pushed(self, project, repo, branch):
         return (repo, int(re.match(r"kandu/(\d+)", branch).group(1))) in self.github.pushed
 
@@ -281,23 +272,14 @@ class FakeRunner:
         self.commands.append((command, secrets))
         return 1 if command in self.failing else 0
 
-    def checkout_changed(self, project, cwd, head):
-        """What a review changed in its checkout: the next of `self.changes`, or nothing."""
-        self.checked = getattr(self, "checked", []) + [(cwd, head)]
-        changes = getattr(self, "changes", [])
-        return changes.pop(0) if changes else None
-
     def run_agent(self, machine, cwd, prompt, allowed, denied, run_id, should_stop, model=None, tokens=None,
-                  schema=None, resume=None, cli="claude", temp_files=False):
+                  schema=None, resume=None):
         with self.lock:
             self.running += 1
             self.most_running = max(self.most_running, self.running)
             step = self.steps.pop(0)
-        if isinstance(step, dict):
-            step = next(each for task, each in step.items() if task in prompt)
         self.runs.append(SimpleNamespace(machine=machine, cwd=cwd, prompt=prompt, allowed=allowed, denied=denied,
-                                         model=model, tokens=tokens, schema=schema, resume=resume,
-                                         cli=cli, temp_files=temp_files))
+                                         model=model, tokens=tokens, schema=schema, resume=resume))
         result = step() if callable(step) else step
         with self.lock:
             self.running -= 1
@@ -326,7 +308,6 @@ class Base(unittest.TestCase):
         self.store = StateStore(self.root / "state")
         self.github.on_add = self.sized  # Most tests are about what comes after the splitter.
         self.usage = Usage(10, 10)
-        self.codex_usage = Usage(10, 10)  # a faked Codex usage answer; an exception here is a read that failed
         self.clock = [NOW]
         self.sup = self.new_supervisor()
 
@@ -336,12 +317,7 @@ class Base(unittest.TestCase):
 
     def new_supervisor(self):
         return Supervisor(self.config, self.store, self.github, self.runner, lambda: self.usage, self.local,
-                          now=lambda: self.clock[0], codex_reader=self.read_codex)
-
-    def read_codex(self):
-        if isinstance(self.codex_usage, Exception):
-            raise self.codex_usage
-        return self.codex_usage
+                          now=lambda: self.clock[0])
 
     def cycle(self):
         self.sup = self.new_supervisor()
@@ -439,14 +415,6 @@ class QueenStepsTest(Base):
         self.runner.steps = [self.reply_none(), '{"result": "pass", "summary": "ok"}', self.reply_none()]
         self.cycle()
         self.assertEqual(self.runner.runs[1].cwd, "/review/origin/main")
-
-    def test_her_check_stays_on_claude_code_whatever_the_project_chose(self):
-        self.config.projects[0].agent_cli = {"worker": "codex", "reviewer": "codex"}
-        self.github.open_pr(REPO, 1, SHA1)
-        self.sup._carry_out([self.step("verify", note="Does main pass its hooks?")], [])
-        self.runner.steps = [self.reply_none(), '{"result": "pass", "summary": "ok"}', self.reply_none()]
-        self.cycle()
-        self.assertEqual([run.cli for run in self.runner.runs], ["claude", "claude", "claude"])
 
     def test_she_opens_a_task_the_stopped_one_waits_on(self):
         body = "\n\n".join(f"## {s}\n- [ ] text" for s in tasks.required_sections())
@@ -1648,545 +1616,6 @@ class GateTest(Base):
                                                              "week_resets": "2026-11-05T20:00:00+01:00"})
 
 
-class CodexUsageTest(Base):
-    """Codex's usage holds Codex's runs alone, and Claude's holds Claude's alone (#79)."""
-    def setUp(self):
-        super().setUp()
-        self.github.add(1)
-
-    def on_codex(self):
-        """Task 1's worker runs on Codex."""
-        self.config.projects[0].agent_cli = {"worker": "codex"}
-
-    def codex_elsewhere(self):
-        """Another project runs on Codex: task 1's runs are all Claude's."""
-        self.config.projects[1].agent_cli = {"worker": "codex"}
-
-    def test_with_no_project_on_codex_nothing_of_codex_is_read_kept_or_told(self):
-        self.codex_usage = AssertionError("Codex must not be read")
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1)]
-        self.cycle()
-        self.assertEqual(self.github.status(1), "In review")
-        self.assertNotIn("codex_usage", self.store.read_current())
-        self.assertEqual(self.events("codex_usage_read"), [])
-
-    def test_a_project_on_codex_has_codex_usage_read_each_cycle_with_when_each_limit_resets(self):
-        self.on_codex()
-        self.github.items.clear()
-        self.codex_usage = Usage(12, 41, "2026-10-30T17:00:00+01:00", "2026-11-04T09:00:00+01:00")
-        self.assertEqual(self.cycle(), "nothing ready")
-        self.assertEqual(self.store.read_current()["codex_usage"], {"session": 12, "week": 41,
-                         "session_resets": "2026-10-30T17:00:00+01:00", "week_resets": "2026-11-04T09:00:00+01:00"})
-        self.assertEqual(self.store.read_current()["usage"]["session"], 10)  # Claude's is its own
-
-    def test_codex_over_its_limit_holds_no_claude_run(self):
-        self.codex_elsewhere()
-        self.codex_usage = Usage(99, 99)
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1)]
-        self.cycle()
-        self.assertEqual([run.cli for run in self.runner.runs], ["claude", "claude"])
-        self.assertEqual(self.github.status(1), "In review")
-
-    def test_codex_usage_that_cannot_be_read_holds_no_claude_run(self):
-        self.codex_elsewhere()
-        self.codex_usage = UsageError("codex refused the usage read: error -32600")
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1)]
-        self.cycle()
-        self.assertEqual(len(self.runner.runs), 2)
-        self.assertEqual(self.github.status(1), "In review")
-
-    def test_a_codex_run_does_not_start_over_codex_limit_and_the_task_waits(self):
-        self.on_codex()
-        self.codex_usage = Usage(70, 0)  # Codex's limits are Claude's values until it has its own: 70% and 60%
-        self.runner.steps = [self.worker_makes_pr()]
-        reason = self.cycle()
-        self.assertEqual(self.runner.runs, [])  # the Codex worker never started
-        self.assertEqual(self.github.status(1), "In progress")  # not failed: it goes on in a later cycle
-        self.assertEqual(self.events("task_finished"), [])
-        self.assertNotIn("5-hour", reason)  # Claude is under its limit, so the cycle does not sleep on one
-
-    def test_a_codex_run_does_not_start_when_codex_usage_cannot_be_read(self):
-        self.on_codex()
-        self.runner.steps = [self.worker_makes_pr()]
-        self.codex_usage = UsageError("codex timed out")
-        self.cycle()
-        self.assertEqual(self.runner.runs, [])
-        self.assertEqual(self.github.status(1), "In progress")
-
-    def test_codex_has_its_own_limits(self):
-        self.on_codex()
-        self.codex_usage = Usage(50, 0)  # under Claude's 70%
-        self.config.settings.codex.limits = UsageLimits(40, 90)
-        self.runner.steps = [self.worker_makes_pr()]
-        self.cycle()
-        self.assertEqual(self.runner.runs, [])
-        self.config.settings.codex.limits = UsageLimits(60, 90)
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1)]
-        self.cycle()  # the task resumes; Codex is under its own limits now
-        self.assertEqual(self.github.status(1), "In review")
-
-    def test_a_codex_run_is_not_held_by_claudes_limit(self):
-        self.on_codex()
-        self.usage = Usage(99, 0)
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1)]
-        reason = self.cycle()
-        self.assertEqual([run.cli for run in self.runner.runs], ["codex"])  # the Codex worker still started
-        self.assertEqual(self.github.status(1), "In review")  # its PR opened; the Claude review waits
-        self.assertIn("5-hour", reason)  # the cycle says Claude's limit, as it always has
-
-    def test_claude_over_its_limit_in_an_install_on_codex_starts_no_claude_run(self):
-        self.codex_elsewhere()
-        self.usage = Usage(70, 0)
-        self.runner.steps = [self.worker_makes_pr()]
-        reason = self.cycle()
-        self.assertIn("5-hour", reason)
-        self.assertEqual(self.runner.runs, [])
-
-    def test_both_over_their_limits_touches_nothing(self):
-        self.on_codex()
-        self.usage, self.codex_usage = Usage(70, 0), Usage(0, 60)
-        self.assertIn("5-hour", self.cycle())
-        self.assertEqual((self.github.reads, self.runner.runs), (0, []))
-
-    def test_each_time_codex_usage_cannot_be_read_is_recorded_once(self):
-        self.on_codex()
-        self.github.items.clear()
-        self.codex_usage = UsageError("codex timed out")
-        self.cycle()
-        self.cycle()
-        self.codex_usage = Usage(1, 1)
-        self.cycle()
-        self.codex_usage = UsageError("could not run codex: FileNotFoundError")
-        self.cycle()
-        self.assertEqual([(e["readable"], e["reason"]) for e in self.events("codex_usage_read")],
-                         [(False, "codex timed out"), (True, ""), (False, "could not run codex: FileNotFoundError")])
-
-
-class CodexWorkerTest(Base):
-    """A project's workers run on Codex when its `agent_cli` says so, and are held as a Claude worker is (#80)."""
-    def setUp(self):
-        super().setUp()
-        self.github.add(1)
-        self.config.projects[0].agent_cli = {"worker": "codex"}
-
-    def comments(self):
-        return self.github.prs[(REPO, 1)]["comments"]
-
-    def test_the_worker_runs_on_codex_and_the_reviewer_on_claude(self):
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1)]
-        self.cycle()
-        self.assertEqual([run.cli for run in self.runner.runs], ["codex", "claude"])
-        self.assertEqual(self.github.status(1), "In review")
-        self.assertEqual(len(self.github.opened), 1)  # Kandu opens its PR, as for a Claude worker
-
-    def test_a_fix_round_runs_on_codex_too(self):
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1, [BLOCKER]), self.worker_pushes(SHA2),
-                             report(SHA2, earlier=[{"n": 1, "result": "fixed", "body": "ok"}])]
-        self.cycle()
-        self.assertEqual([run.cli for run in self.runner.runs], ["codex", "claude", "codex", "claude"])
-        self.assertIn("This breaks.", self.runner.runs[2].prompt)
-        self.assertEqual(self.github.status(1), "In review")
-
-    def test_a_codex_worker_never_gets_claudes_model(self):
-        self.config.settings.claude.models = {"worker": "claude-model", "reviewer": "claude-model"}
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1)]
-        self.cycle()
-        self.assertEqual([run.model for run in self.runner.runs], [None, "claude-model"])
-
-    def test_a_codex_worker_is_denied_what_a_claude_worker_is(self):
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1)]
-        self.cycle()
-        worker = self.runner.runs[0]
-        for rule in agents.KANDU_ONLY:
-            self.assertIn(rule, worker.denied)
-
-    def test_a_project_left_on_claude_runs_as_before(self):
-        self.config.projects[0].agent_cli = {}
-        self.runner.changed = {SHA1: ["migrations/001.sql"]}
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1)]
-        self.cycle()
-        self.assertEqual([run.cli for run in self.runner.runs], ["claude", "claude"])
-        self.assertFalse(hasattr(self.runner, "diffs"))  # nothing of Codex's check runs
-        self.assertEqual(self.events("review_finished")[0]["blockers"], 0)
-
-    def test_codex_missing_or_logged_out_on_its_machine_starts_no_worker(self):
-        for why in ("not installed", "not logged in; run: codex login"):
-            self.runner.codex_out = {"server": why}
-            self.runner.steps = [self.worker_makes_pr()]
-            self.cycle()
-            self.assertEqual(self.runner.runs, [])
-            self.assertEqual(self.github.opened, [])
-            self.assertNotEqual(self.github.status(1), "Blocked")  # not the task's fault: it waits
-            said = [e["reason"] for e in self.events("decision") if e["decision"] == "codex_unavailable"]
-            self.assertEqual(said[-1], f"Codex on server: {why}")
-        self.runner.codex_out = {}
-        self.cycle()  # Codex works there again: the task goes on
-        self.assertEqual([run.cli for run in self.runner.runs], ["codex"])
-
-    def test_a_pr_that_changes_a_forbidden_area_is_sent_back_with_the_areas_and_not_merged(self):
-        self.config.projects[0].auto_merge = True
-        self.runner.changed = {SHA1: ["src/a.py", "migrations/001.sql", "src/payments/pay.py"], SHA2: ["src/a.py"]}
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1), self.worker_pushes(SHA2),
-                             report(SHA2, earlier=[{"n": 1, "result": "fixed", "body": "ok"}])]
-        self.cycle()
-        first = self.comments()[0]["body"]
-        self.assertIn("**Blocker 1**", first)
-        self.assertIn("`migrations/`", first)
-        self.assertIn("`src/payments/`", first)
-        fix = self.runner.runs[2]
-        self.assertEqual(fix.cli, "codex")
-        self.assertIn("`migrations/`", fix.prompt)  # the task goes back with the areas it changed
-        self.assertEqual([e["blockers"] for e in self.events("review_finished")], [1, 0])
-        self.assertEqual(self.github.merges, [SHA2])  # only the head that leaves them alone merges
-
-    def test_an_area_without_a_slash_is_one_path_or_a_pattern(self):
-        self.config.projects[0].auto_merge = True
-        self.config.projects[0].forbidden = ["Makefile", "*.lock"]
-        self.runner.changed = {SHA1: ["src/a.py", "Makefile", "deps/uv.lock"],
-                               SHA2: ["src/a.py", "src/Makefile", "Makefile.old", "lock.md"]}
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1), self.worker_pushes(SHA2),
-                             report(SHA2, earlier=[{"n": 1, "result": "fixed", "body": "ok"}])]
-        self.cycle()
-        first = self.comments()[0]["body"]
-        self.assertIn("`Makefile`", first)
-        self.assertIn("`*.lock`", first)
-        self.assertEqual([e["blockers"] for e in self.events("review_finished")], [1, 0])
-        self.assertEqual(self.github.merges, [SHA2])  # another path that only looks like the area is not in it
-
-    def test_a_pr_that_still_changes_a_forbidden_area_never_merges_whatever_the_review_says(self):
-        self.config.projects[0].auto_merge = True
-        self.runner.changed = {SHA1: ["migrations/001.sql"], SHA2: ["migrations/001.sql", "a.py"]}
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1), self.worker_pushes(SHA2),
-                             report(SHA2, earlier=[{"n": 1, "result": "fixed", "body": "ok"}])]
-        self.cycle()
-        self.assertEqual(self.github.merges, [])
-        self.assertEqual([e["blockers"] for e in self.events("review_finished")], [1, 1])
-        self.assertEqual(self.github.status(1), "Blocked")
-        self.assertIn("`migrations/`", self.comments()[1]["body"])
-
-    def test_the_check_reads_the_reviewed_head_against_the_default_branch(self):
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1)]
-        self.cycle()
-        self.assertEqual(self.runner.diffs, [(f"/review/{SHA1}", "main", SHA1)])
-
-
-class DashboardWorkerCliTest(Base):
-    """The agent CLI chosen for a project's workers on the dashboard wins over the registry, from the next worker that
-    starts (#81)."""
-    def setUp(self):
-        super().setUp()
-        self.github.add(1)
-
-    def choose(self, cli):
-        self.store.set_project_setting("website", "worker_cli", cli)
-
-    def test_the_dashboards_codex_wins_over_the_registrys_claude(self):
-        self.choose("codex")
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1)]
-        self.cycle()
-        self.assertEqual([run.cli for run in self.runner.runs], ["codex", "claude"])
-        self.assertIn("codex_usage", self.store.read_current())  # the project uses Codex now: its usage is read
-
-    def test_the_dashboards_claude_wins_over_the_registrys_codex(self):
-        self.config.projects[0].agent_cli = {"worker": "codex"}
-        self.choose("claude")
-        self.codex_usage = AssertionError("Codex must not be read")
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1)]
-        self.cycle()
-        self.assertEqual([run.cli for run in self.runner.runs], ["claude", "claude"])
-        self.assertNotIn("codex_usage", self.store.read_current())
-
-    def test_a_change_reaches_the_next_worker_and_never_the_one_running(self):
-        def worker_while_the_user_chooses_codex():
-            self.choose("codex")
-            return self.worker_makes_pr()()
-
-        self.runner.steps = [worker_while_the_user_chooses_codex, report(SHA1, [BLOCKER]), self.worker_pushes(SHA2),
-                             report(SHA2, earlier=[{"n": 1, "result": "fixed", "body": "ok"}])]
-        self.cycle()
-        self.assertEqual([run.cli for run in self.runner.runs], ["claude", "claude", "codex", "claude"])
-
-    def test_what_a_codex_worker_changed_is_still_read_after_a_switch_to_claude_while_it_ran(self):
-        self.config.projects[0].auto_merge = True
-        self.choose("codex")
-
-        def codex_worker_while_the_user_chooses_claude():
-            self.choose("claude")
-            return self.worker_makes_pr()()
-
-        self.runner.changed = {SHA1: ["migrations/001.sql"], SHA2: ["src/a.py"]}
-        self.runner.steps = [codex_worker_while_the_user_chooses_claude, report(SHA1), self.worker_pushes(SHA2),
-                             report(SHA2, earlier=[{"n": 1, "result": "fixed", "body": "ok"}])]
-        self.cycle()
-        self.assertEqual([run.cli for run in self.runner.runs], ["codex", "claude", "claude", "claude"])
-        self.assertIn("`migrations/`", self.github.prs[(REPO, 1)]["comments"][0]["body"])
-        self.assertEqual([e["blockers"] for e in self.events("review_finished")], [1, 0])
-        self.assertEqual(self.github.merges, [SHA2])  # Codex's change to a forbidden area never merged
-
-    def test_a_forbidden_area_codex_changed_still_holds_the_pr_after_a_switch_to_claude(self):
-        self.config.projects[0].auto_merge = True
-        self.choose("codex")
-
-        def review_while_the_user_chooses_claude():
-            self.choose("claude")
-            return report(SHA1)
-
-        self.runner.changed = {SHA1: ["migrations/001.sql"], SHA2: ["migrations/001.sql", "a.py"]}
-        self.runner.steps = [self.worker_makes_pr(), review_while_the_user_chooses_claude, self.worker_pushes(SHA2),
-                             report(SHA2, earlier=[{"n": 1, "result": "fixed", "body": "ok"}])]
-        self.cycle()
-        self.assertEqual([run.cli for run in self.runner.runs], ["codex", "claude", "claude", "claude"])
-        self.assertEqual([e["blockers"] for e in self.events("review_finished")], [1, 1])
-        self.assertEqual(self.github.merges, [])  # Codex's change is still in the PR, whoever works on it now
-
-
-class CodexReviewerTest(Base):
-    """A project's reviewers run on Codex when it says so, chosen apart from its workers (#82)."""
-    def setUp(self):
-        super().setUp()
-        self.github.add(1)
-        self.config.projects[0].agent_cli = {"reviewer": "codex"}
-
-    def clis(self):
-        return [run.cli for run in self.runner.runs]
-
-    def comments(self):
-        return self.github.prs[(REPO, 1)]["comments"]
-
-    def test_claude_workers_with_codex_reviewers(self):
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1, [NOTE], wait=["Ship it on Friday?"])]
-        self.cycle()
-        self.assertEqual(self.clis(), ["claude", "codex"])
-        self.assertEqual(self.runner.runs[1].schema, review.REPORT_SCHEMA)
-        body = self.comments()[0]["body"]
-        self.assertIn("**Kandu review, round 1**", body)
-        self.assertIn("- c: met", body)  # each criterion's verdict
-        self.assertIn("**Waits for you:** Ship it on Friday?", body)
-        finished = self.events("review_finished")[0]
-        self.assertEqual((finished["findings"], finished["wait_for_user"]), (1, ["Ship it on Friday?"]))
-
-    def test_codex_workers_with_claude_reviewers(self):
-        self.config.projects[0].agent_cli = {"worker": "codex"}
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1)]
-        self.cycle()
-        self.assertEqual(self.clis(), ["codex", "claude"])
-
-    def test_codex_workers_with_codex_reviewers(self):
-        self.config.projects[0].agent_cli = {"worker": "codex", "reviewer": "codex"}
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1)]
-        self.cycle()
-        self.assertEqual(self.clis(), ["codex", "codex"])
-
-    def reviewer_with(self, rules):
-        self.config.settings.permissions.reviewer = rules
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1)]
-        self.cycle()
-        reviewer = self.runner.runs[1]
-        self.assertEqual(reviewer.cli, "codex")
-        edits = [rule for rule in reviewer.allowed if rule.split("(")[0] in ("Edit", "Write", "NotebookEdit", "MultiEdit")]
-        self.assertEqual(edits, [])  # an allow list with no edit rule: code checks its checkout after
-        return reviewer
-
-    def test_a_codex_reviewer_with_no_rules_in_the_config_may_change_no_file(self):
-        self.assertIsNotNone(self.reviewer_with(None).allowed)
-
-    def test_a_codex_reviewer_may_change_no_file_whatever_its_rules_allow(self):
-        reviewer = self.reviewer_with(Rules(allow=["Read", "Edit", "Write(**)", "Bash(git diff *)"],
-                                            deny=["Read(**/.env)"]))
-        self.assertIn("Bash(npm test)", reviewer.allowed)  # it may run the project's tests
-        self.assertIn("Bash(git diff *)", reviewer.allowed)
-        self.assertIn("Read(**/.env)", reviewer.denied)
-
-    def test_a_claude_reviewer_keeps_its_rules_as_before(self):
-        self.config.projects[0].agent_cli = {"worker": "codex"}
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1)]
-        self.cycle()
-        self.assertIsNone(self.runner.runs[1].allowed)  # no reviewer rules in the config: it may do everything
-
-    def test_the_second_review_carries_the_earlier_findings_over_on_codex(self):
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1, [BLOCKER]), self.worker_pushes(SHA2),
-                             report(SHA2, earlier=[{"n": 1, "result": "not_fixed", "body": "Still breaks."}])]
-        self.cycle()
-        self.assertEqual(self.clis(), ["claude", "codex", "claude", "codex"])
-        self.assertIn("This breaks.", self.runner.runs[3].prompt)  # the second review is asked about the blocker
-        second = review.reviews_on(self.github.prs[(REPO, 1)], ACCOUNT)[1]
-        self.assertTrue(second["second"])
-        self.assertEqual([f["n"] for f in second["open"]], [1])  # the blocker not fixed is carried over
-        self.assertEqual([e["blockers"] for e in self.events("review_finished")], [1, 1])
-
-    def test_a_second_review_takes_the_choice_made_since(self):
-        def fix_while_the_user_chooses_claude():
-            self.store.set_project_setting("website", "reviewer_cli", "claude")
-            return self.worker_pushes(SHA2)()
-
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1, [BLOCKER]), fix_while_the_user_chooses_claude,
-                             report(SHA2, earlier=[{"n": 1, "result": "fixed", "body": "ok"}])]
-        self.cycle()
-        self.assertEqual(self.clis(), ["claude", "codex", "claude", "claude"])
-        self.assertIn("This breaks.", self.runner.runs[3].prompt)  # Claude is asked about Codex's blocker
-        second = review.reviews_on(self.github.prs[(REPO, 1)], ACCOUNT)[1]
-        self.assertTrue(second["second"])
-        self.assertEqual([e["blockers"] for e in self.events("review_finished")], [1, 0])
-
-    def test_a_second_review_whose_first_names_an_unknown_program_runs_on_the_projects_choice(self):
-        def fix_after_the_first_review_names_gemini():
-            first = self.comments()[0]
-            self.assertIn('"cli": "codex"', first["body"])
-            first["body"] = first["body"].replace('"cli": "codex"', '"cli": "gemini"')
-            return self.worker_pushes(SHA2)()
-
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1, [BLOCKER]), fix_after_the_first_review_names_gemini,
-                             report(SHA2, earlier=[{"n": 1, "result": "fixed", "body": "ok"}])]
-        self.cycle()
-        self.assertEqual(self.clis(), ["claude", "codex", "claude", "codex"])  # the project's reviewer choice
-        self.assertEqual([e["blockers"] for e in self.events("review_finished")], [1, 0])
-
-    def test_a_first_review_takes_the_choice_made_since(self):
-        def worker_while_the_user_chooses_claude():
-            self.store.set_project_setting("website", "reviewer_cli", "claude")
-            return self.worker_makes_pr()()
-
-        self.runner.steps = [worker_while_the_user_chooses_claude, report(SHA1)]
-        self.cycle()
-        self.assertEqual(self.clis(), ["claude", "claude"])
-
-    def test_choosing_codex_workers_on_the_dashboard_leaves_the_reviewers_on_claude(self):
-        self.config.projects[0].agent_cli = {}
-        self.store.set_project_setting("website", "worker_cli", "codex")
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1)]
-        self.cycle()
-        self.assertEqual(self.clis(), ["codex", "claude"])
-
-    def test_the_dashboards_reviewer_choice_wins_over_the_registry(self):
-        self.config.projects[0].agent_cli = {"worker": "codex"}
-        self.store.set_project_setting("website", "reviewer_cli", "codex")
-        self.store.set_project_setting("website", "worker_cli", "claude")
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1)]
-        self.cycle()
-        self.assertEqual(self.clis(), ["claude", "codex"])
-        self.assertIn("codex_usage", self.store.read_current())  # the project uses Codex: its usage is read
-
-    def test_the_dashboards_claude_reviewer_wins_over_the_registrys_codex(self):
-        self.store.set_project_setting("website", "reviewer_cli", "claude")
-        self.codex_usage = AssertionError("Codex must not be read")
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1)]
-        self.cycle()
-        self.assertEqual(self.clis(), ["claude", "claude"])
-        self.assertNotIn("codex_usage", self.store.read_current())
-
-    def test_a_codex_review_over_codexs_limit_waits_and_claude_runs_go_on(self):
-        self.github.add(2)
-        self.codex_usage = Usage(99, 0)
-        workers = {f"{REPO}#1": self.worker_makes_pr(1, SHA1), f"{REPO}#2": self.worker_makes_pr(2, SHA2)}
-        self.runner.steps = [workers, workers]  # the two run side by side, in either order
-        reason = self.cycle()
-        self.assertEqual(self.clis(), ["claude", "claude"])  # both workers ran; no Codex review started
-        self.assertEqual((self.github.status(1), self.github.status(2)), ("In review", "In review"))
-        self.assertEqual(self.events("review_finished"), [])
-        self.assertEqual(self.events("task_finished"), [])  # not failed: the review comes in a later cycle
-        self.assertNotIn("5-hour", reason)
-        self.codex_usage = Usage(10, 0)
-        reviews = {f"{REPO}#1": report(SHA1), f"{REPO}#2": report(SHA2)}
-        self.runner.steps = [reviews, reviews]
-        self.cycle()
-        self.assertEqual(self.clis()[2:], ["codex", "codex"])
-
-    def test_a_codex_review_does_not_start_on_a_machine_without_a_working_codex(self):
-        self.runner.codex_out = {"server": "not logged in; run: codex login"}
-        self.runner.steps = [self.worker_makes_pr()]
-        self.cycle()
-        self.assertEqual(self.clis(), ["claude"])
-        self.assertEqual(self.github.status(1), "In review")
-        said = [e["reason"] for e in self.events("decision") if e["decision"] == "codex_unavailable"]
-        self.assertEqual(said, ["Codex on server: not logged in; run: codex login"])
-        self.runner.codex_out = {}
-        self.runner.steps = [report(SHA1)]
-        self.cycle()
-        self.assertEqual(self.clis(), ["claude", "codex"])
-
-    def test_a_codex_review_that_could_start_no_command_counts_for_nothing(self):
-        refused = AgentResult(text=report(SHA1, [BLOCKER]), models={"codex": {"input": 1, "output": 1}},
-                              duration_ms=1, is_error=False, cli="codex", no_command_started=True)
-        self.runner.steps = [self.worker_makes_pr(), refused]
-        self.cycle()
-        self.assertEqual(self.clis(), ["claude", "codex"])
-        self.assertEqual(self.events("review_finished"), [])  # its blocker is not posted or counted
-        self.assertEqual(self.events("task_finished"), [])
-        self.assertEqual(self.github.status(1), "In review")  # the review comes in a later cycle
-        said = [e["reason"] for e in self.events("decision") if e["decision"] == "codex_unavailable"]
-        self.assertEqual(len(said), 1)
-        self.assertIn("could start no command", said[0])
-        self.runner.steps = [report(SHA1)]
-        self.cycle()
-        self.assertEqual(self.events("review_finished")[0]["blockers"], 0)
-
-    def test_only_a_codex_review_may_write_temp_files(self):
-        self.config.projects[0].agent_cli = {"worker": "codex", "reviewer": "codex"}
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1)]
-        self.cycle()
-        self.assertEqual([(run.cli, run.temp_files) for run in self.runner.runs], [("codex", False), ("codex", True)])
-
-    def test_a_codex_review_that_left_its_checkout_as_it_was_is_posted(self):
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1)]
-        self.cycle()
-        self.assertEqual(self.runner.checked, [(f"/review/{SHA1}", SHA1)])
-        self.assertEqual(len(self.comments()), 1)
-        self.assertEqual(self.changed_checkout(), [])
-
-    def changed_checkout(self):
-        return [e["reason"] for e in self.events("decision") if e["decision"] == "review_changed_checkout"]
-
-    def test_a_codex_review_that_changed_its_checkout_is_not_posted_and_runs_once_more(self):
-        self.runner.changes = ["tracked files changed: a.py"]
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1, [BLOCKER]), report(SHA1)]
-        self.cycle()
-        self.assertEqual(self.clis(), ["claude", "codex", "codex"])
-        self.assertEqual(len(self.runner.checked), 2)
-        [why] = self.changed_checkout()
-        self.assertIn("tracked files changed: a.py", why)
-        # Only the second review is posted: the first one's blocker is nowhere.
-        self.assertEqual(len(self.comments()), 1)
-        self.assertNotIn("This breaks.", self.comments()[0]["body"])
-        self.assertEqual([e["findings"] for e in self.events("review_finished")], [0])
-
-    def test_a_codex_review_that_changes_its_checkout_twice_stops_the_task_for_the_user(self):
-        self.runner.changes = ["tracked files changed: a.py", "the checkout moved from a to b"]
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1), report(SHA1)]
-        self.cycle()
-        self.assertEqual(self.clis(), ["claude", "codex", "codex"])
-        self.assertEqual(len(self.changed_checkout()), 2)
-        self.assertEqual(self.comments(), [])
-        self.assertEqual(self.events("review_finished"), [])
-        self.assertEqual(self.github.status(1), "Blocked")
-        failed = [e["reason"] for e in self.events("decision") if e["decision"] == "failed"]
-        self.assertEqual(len(failed), 1)
-        self.assertIn("the checkout moved from a to b", failed[0])
-
-    def test_a_claude_review_is_not_checked_as_a_codex_one(self):
-        self.config.projects[0].agent_cli = {"worker": "codex"}
-        self.runner.changes = ["tracked files changed: a.py"]
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1)]
-        self.cycle()
-        self.assertEqual([(run.cli, run.temp_files) for run in self.runner.runs], [("codex", False), ("claude", False)])
-        self.assertFalse(hasattr(self.runner, "checked"))
-        self.assertEqual(len(self.comments()), 1)
-
-    def test_a_codex_review_gets_no_claude_model(self):
-        self.config.settings.claude.models = {"worker": "claude-model", "reviewer": "claude-model"}
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1)]
-        self.cycle()
-        self.assertEqual([run.model for run in self.runner.runs], ["claude-model", None])
-
-    def test_the_live_check_stays_on_claude_code(self):
-        self.config.projects[0].agent_cli = {"worker": "codex", "reviewer": "codex"}
-        self.config.projects[0].auto_merge = True
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1), '{"result": "pass", "summary": "seen"}']
-        self.cycle()
-        self.assertEqual(self.github.merges, [SHA1])
-        self.assertEqual(self.clis(), ["codex", "codex", "claude"])
-        self.assertEqual(self.github.status(1), "Done")
-
-
 class ParallelTest(Base):
     def test_project_cap_runs_tasks_in_turn(self):
         self.config.projects[0].max_parallel_workers = 1
@@ -2439,19 +1868,6 @@ class FirstRunTest(Base):
         self.assertIn("worker reply is not JSON", again.prompt)
         self.assertEqual(self.github.status(1), "In review")
         self.assertEqual(self.events("decision")[0]["decision"], "reply_reasked")
-
-    def test_a_broken_codex_reply_is_asked_for_again_in_the_same_codex_session(self):
-        broken = AgentResult(text="All done!", models={}, duration_ms=1, is_error=False, session_id="t-1", cli="codex")
-        self.runner.steps = [broken, self.worker_makes_pr(), report(SHA1)]
-        self.cycle()
-        again = self.runner.runs[1]
-        self.assertEqual((again.cli, again.resume, again.schema, again.model), ("codex", "t-1", agents.WORKER_SCHEMA, None))
-        self.assertEqual(self.github.status(1), "In review")
-
-    def test_every_role_runs_on_claude_code_unless_one_is_named(self):
-        self.runner.steps = [self.worker_makes_pr(), report(SHA1)]
-        self.cycle()
-        self.assertEqual([run.cli for run in self.runner.runs], ["claude", "claude"])
 
     def test_a_reply_broken_twice_stops_the_task(self):
         self.tried_before()

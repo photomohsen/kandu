@@ -18,11 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import ghmeter
-from .config import AGENT_CLIS, CLAUDE, CODEX
 from .didban import remote_path
 from .state import usage_from_result
-from .usage import (CODEX_LOGGED_OUT, CODEX_NO_ANSWER, CODEX_NO_SANDBOX, CODEX_NOT_INSTALLED, CODEX_SANDBOX_PROBE,
-                    TIMEOUT_SECONDS as CODEX_LOGIN_TIMEOUT)
 
 DEFAULT_LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
 GIT_TIMEOUT_SECONDS = 300
@@ -76,11 +73,6 @@ def child_env(run_id=None):
                                         if not name.startswith(SECRET_PREFIX)})
 
 
-# The program that runs an agent (GLOSSARY "Agent CLI"), from config: a caller that names none gets Claude Code.
-# Rules that let a run change files: with one, a Codex run may write in its checkout.
-EDIT_TOOLS = ("Edit", "Write", "NotebookEdit", "MultiEdit")
-
-
 @dataclass
 class AgentResult:
     text: str = ""
@@ -89,8 +81,6 @@ class AgentResult:
     is_error: bool = True
     stopped: bool = False
     session_id: str | None = None  # A broken reply is asked for again in this session.
-    cli: str = CLAUDE  # ... and with this agent CLI.
-    no_command_started: bool = False  # It tried commands and none started: its machine, not its work, failed.
 
 
 class Host:
@@ -217,241 +207,12 @@ def _worktree_dir(path, name):
     return f"{path.rstrip('/')}.kandu-worktrees/{name}"
 
 
-def _event(line):
-    """One line of an agent CLI's output as a JSON object, or None: a CLI also writes plain lines of its own."""
+def _last_result(line, found):
     try:
         event = json.loads(line)
     except json.JSONDecodeError:
-        return None
-    return event if isinstance(event, dict) else None
-
-
-# A `claude -p` run ends when its turn does, and with it every job it left running: a tool that waits for a later
-# turn would kill a test still going. So no run gets one, whatever its rules allow.
-LATER_TURN_TOOLS = ["ScheduleWakeup", "CronCreate", "Monitor"]
-# Claude Code holds one shell command to 10 minutes; a project's tests may take longer, and the run must wait for them
-# in the same turn. The cycle's deadline still ends a run that outlasts it.
-LONGEST_COMMAND_MS = 60 * 60 * 1000
-CLAUDE_RUN_SETTINGS = json.dumps({"env": {"BASH_MAX_TIMEOUT_MS": str(LONGEST_COMMAND_MS)}})
-
-
-def _claude_command(allowed, denied, model, schema, resume):
-    # With no allow list the run may do everything; the deny list still holds.
-    mode = ["--permission-mode", "bypassPermissions"] if allowed is None else \
-        ["--permission-mode", "dontAsk", "--allowedTools", *allowed]
-    return ["claude", "-p", "--output-format", "stream-json", "--verbose", *mode,
-            # A repo's own settings must not change what this run may do.
-            "--setting-sources", "user", "--settings", CLAUDE_RUN_SETTINGS,
-            *(["--model", model] if model else []),
-            *(["--resume", resume] if resume else []),
-            *(["--json-schema", json.dumps(schema)] if schema else []),
-            "--disallowedTools", *(denied or []), *LATER_TURN_TOOLS]
-
-
-class _ClaudeReply:
-    """Reads `claude`'s `stream-json` output: its last `result` event is the run's."""
-
-    def __init__(self):
-        self.result = None
-
-    def read(self, line):
-        event = _event(line)
-        if event is not None and event.get("type") == "result":
-            self.result = event
-
-    def finish(self, returncode, stopped, duration_ms):
-        result = self.result
-        if result is None:
-            return AgentResult(stopped=stopped)
-        usage = usage_from_result(result)
-        structured = result.get("structured_output")
-        text = json.dumps(structured, ensure_ascii=False) if structured is not None else result.get("result") or ""
-        return AgentResult(text=text, models=usage["models"], duration_ms=usage["duration_ms"],
-                           is_error=usage["is_error"] or returncode != 0, stopped=stopped,
-                           session_id=result.get("session_id"))
-
-
-# A run that may change no file but writes temp files, such as a reviewer's tests: it writes its checkout and the
-# temp folders alone, with the network as read-only has it, off, whatever Codex's own config says. Code checks after
-# the run that the checkout is unchanged (`Runner.checkout_changed`).
-TEMP_FILES_LIMITS = ["--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=false",
-                     "-c", "sandbox_workspace_write.writable_roots=[]",
-                     "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=false",
-                     "-c", "sandbox_workspace_write.exclude_slash_tmp=false"]
-
-
-def _codex_limits(host, cwd, allowed, temp_files=False):
-    """Codex's sandbox for a run's allow list. Codex cannot deny single rules: code checks what a run changed."""
-    if allowed is None:
-        return ["--dangerously-bypass-approvals-and-sandbox"]
-    if not any(rule.split("(")[0] in EDIT_TOOLS for rule in allowed):
-        return list(TEMP_FILES_LIMITS) if temp_files else ["--sandbox", "read-only"]
-    limits = ["--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"]
-    # A worktree's commits go to its copy's git folder, outside the checkout.
-    found = host.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=cwd)
-    return limits + (["--add-dir", found.stdout.strip()] if found.returncode == 0 and found.stdout.strip() else [])
-
-
-# A Codex run's commands, as Claude's `Bash(...)` rules name them: the program, then what its arguments start with.
-BASH_RULE = re.compile(r"Bash\(([A-Za-z0-9._+-]+)(?: (.*))?\)")
-PROGRAM_NAME = re.compile(r"[A-Za-z0-9._+-]+")
-# Stands in for one program on a Codex run's PATH: refuses what the run's deny list names, runs the rest as it is.
-# It comes after the meter, which counts a `gh` call first, and passes it by when it looks for the real program.
-HELD_PROGRAM = """#!/bin/sh
-case "$*" in
-  {patterns}) echo "kandu: denied in this run: {program} $*" >&2; exit 1 ;;
-esac
-here=$(dirname "$0")
-IFS=:
-set -f
-for dir in $PATH; do
-  [ -n "$dir" ] && [ "$dir" != "$here" ] && [ "$dir" != {meter} ] && [ -x "$dir/{program}" ] && exec "$dir/{program}" "$@"
-done
-echo "{program}: not found" >&2
-exit 127
-"""
-# Codex's answer for this machine: 127 when there is no `codex` on its PATH, 1 when `codex login status` fails, 3 when
-# its sandbox cannot run a command there.
-CODEX_LOGIN = ('command -v codex >/dev/null 2>&1 || exit 127; codex login status >/dev/null 2>&1 || exit 1; '
-               f'codex {" ".join(CODEX_SANDBOX_PROBE)} >/dev/null 2>&1 || exit 3')
-
-
-def _case_pattern(rest):
-    """A shell `case` pattern for a rule's arguments: `*` stays a wildcard, the rest is literal. A rule that ends in
-    ` *` or `:*` holds the words before it alone too, as Claude Code does."""
-    if rest.endswith(":*"):
-        rest = rest[:-2] + " *"
-    glob = lambda text: "*".join(shlex.quote(piece) for piece in text.split("*"))
-    return f"{glob(rest[:-2])}|{glob(rest)}" if rest.endswith(" *") else glob(rest)
-
-
-def held_programs(denied):
-    """The stand-ins for a Codex run's deny list: {program: script}. Codex cannot deny a single command, so each
-    program a `Bash(...)` rule names is found first on the run's PATH, and refuses what the rules name."""
-    patterns = defaultdict(list)
-    for rule in denied or []:
-        found = BASH_RULE.fullmatch(rule.strip())
-        if found and PROGRAM_NAME.fullmatch(found.group(1)):
-            patterns[found.group(1)].append(_case_pattern(found.group(2) or ""))
-    return {program: HELD_PROGRAM.format(program=program, patterns="|".join(rules),
-                                         meter=shlex.quote(str(ghmeter.METER_DIR)))
-            for program, rules in patterns.items()}
-
-
-def _put_held(host, programs):
-    """Writes the stand-ins to a new folder on the host's machine and returns its path."""
-    script = ('d=$(mktemp -d "${TMPDIR:-/tmp}/kandu-held.XXXXXX") || exit 1; '
-              'while [ $# -gt 0 ]; do printf %s "$2" > "$d/$1" && chmod 755 "$d/$1" || exit 1; shift 2; done; '
-              'printf %s "$d"')
-    return host.check(["sh", "-c", script, "sh", *[part for item in programs.items() for part in item]])
-
-
-def _held(folder, command):
-    """`command` with `folder` on its PATH right after the meter, and so on the PATH of every command it starts."""
-    return ["sh", "-c", 'PATH="$1:$2:$PATH"; export PATH; shift 2; exec "$@"', "sh", str(ghmeter.METER_DIR), folder,
-            *command]
-
-
-def _codex_command(limits, model, schema_file, resume, held=False):
-    """With `held`, Codex runs its commands in plain shells, never login ones: a login profile may put another
-    folder ahead of the held programs on PATH, and so run the real program."""
-    return ["codex", "exec", "--json", "--skip-git-repo-check",
-            # Codex gets Kandu's instructions alone, never the repo's own agent files.
-            "-c", "project_doc_max_bytes=0", *limits,
-            *(["-c", "allow_login_shell=false"] if held else []),
-            *(["--model", model] if model else []),
-            *(["--output-schema", schema_file] if schema_file else []),
-            *(["resume", resume] if resume else []),
-            "-"]  # the prompt, on stdin
-
-
-def strict_schema(schema):
-    """`schema` as OpenAI's structured outputs hold a reply to it: every object names all its keys as required and
-    allows no other, so a key that was optional may be null instead (`without_unset` takes those nulls out)."""
-    if not isinstance(schema, dict):
-        return schema
-    strict = dict(schema)
-    if isinstance(schema.get("items"), dict):
-        strict["items"] = strict_schema(schema["items"])
-    if isinstance(schema.get("properties"), dict):
-        required = set(schema.get("required", []))
-        strict["properties"] = {name: strict_schema(rule) if name in required else
-                                {"anyOf": [strict_schema(rule), {"type": "null"}]}
-                                for name, rule in schema["properties"].items()}
-        strict["required"] = list(schema["properties"])
-        strict["additionalProperties"] = False
-    return strict
-
-
-def without_unset(value, schema):
-    """A reply to `strict_schema(schema)` as a reply to `schema`: an optional key that is null is left out."""
-    if not isinstance(schema, dict):
-        return value
-    if isinstance(value, dict) and isinstance(schema.get("properties"), dict):
-        rules, required = schema["properties"], set(schema.get("required", []))
-        return {key: without_unset(item, rules.get(key)) for key, item in value.items()
-                if not (item is None and key in rules and key not in required)}
-    if isinstance(value, list) and isinstance(schema.get("items"), dict):
-        return [without_unset(item, schema["items"]) for item in value]
-    return value
-
-
-class _CodexReply:
-    """Reads `codex exec --json` output: its thread is the session, its last message the reply."""
-
-    def __init__(self, model, schema):
-        self.model = model or CODEX  # Codex does not say which model its default is.
-        self.schema = schema
-        self.session_id = None
-        self.text = ""
-        self.tokens = None
-        self.failed = False
-        self.commands_tried = 0
-        self.commands_started = 0
-
-    def read(self, line):
-        event = _event(line)
-        kind = event and event.get("type")
-        item = event.get("item") if kind == "item.completed" else None
-        if kind == "thread.started":
-            self.session_id = event.get("thread_id")
-        elif isinstance(item, dict) and item.get("type") == "agent_message" and isinstance(item.get("text"), str):
-            self.text = item["text"]
-        elif isinstance(item, dict) and item.get("type") == "command_execution":
-            # A command that ran has its own exit code, 0 or not; one Codex could not start has none, or -1.
-            self.commands_tried += 1
-            code = item.get("exit_code")
-            self.commands_started += isinstance(code, int) and not isinstance(code, bool) and code >= 0
-        elif kind == "turn.completed":
-            usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
-            cached = usage.get("cached_input_tokens", 0)
-            tokens = self.tokens or {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}
-            # Codex's input counts its cached input too; Kandu counts that as cache reads alone.
-            tokens["input"] += max(usage.get("input_tokens", 0) - cached, 0)
-            tokens["output"] += usage.get("output_tokens", 0)
-            tokens["cache_read"] += cached
-            tokens["cache_creation"] += usage.get("cache_write_input_tokens", 0)
-            self.tokens = tokens
-        elif kind == "turn.failed":
-            self.failed = True
-
-    def finish(self, returncode, stopped, duration_ms):
-        text = self.text
-        if self.schema is not None:
-            try:
-                text = json.dumps(without_unset(json.loads(text), self.schema), ensure_ascii=False)
-            except json.JSONDecodeError:
-                pass  # a reply that cannot be read stays as it is, to be asked for again
-        return AgentResult(text=text, models={self.model: self.tokens} if self.tokens else {},
-                           duration_ms=duration_ms, stopped=stopped, session_id=self.session_id, cli=CODEX,
-                           is_error=self.failed or self.tokens is None or returncode != 0,
-                           no_command_started=self.commands_tried > 0 and self.commands_started == 0)
-
-
-def _put_schema(host, schema):
-    """Writes `schema` to a new file on the host's machine and returns its path: Codex reads a schema from a file."""
-    script = 'f=$(mktemp "${TMPDIR:-/tmp}/kandu-schema.XXXXXX") && printf %s "$1" > "$f" && printf %s "$f"'
-    return host.check(["sh", "-c", script, "sh", json.dumps(schema)])
+        return found
+    return event if isinstance(event, dict) and event.get("type") == "result" else found
 
 
 class Runner:
@@ -636,29 +397,6 @@ class Runner:
             raise RunnerError(f"git grep failed on {host.name}: {found.stderr.strip()}")
         return [line.removeprefix(f"{ref}:") for line in found.stdout.splitlines() if line]
 
-    def changed_paths(self, project, repo, directory, base, head_sha):
-        """The paths `head_sha` changed since it left `origin/<base>`: what its PR changes. A file moved counts at
-        both its old and its new path."""
-        host = self.hosts[project.machine]
-        with self._repo_locks[(host.name, repo)]:
-            host.check(["git", "fetch", "origin"], cwd=directory)
-        return host.check(["git", "diff", "--name-only", "--no-renames", f"origin/{base}...{head_sha}"],
-                          cwd=directory).splitlines()
-
-    def codex_login(self, machine):
-        """None when Codex is installed and logged in on `machine` and its sandbox runs a command; otherwise why not. `Unreachable` when the
-        machine does not answer: that says nothing of Codex."""
-        host = self.hosts[machine]
-        try:
-            found = host._answered(host.run(["sh", "-c", CODEX_LOGIN], timeout=CODEX_LOGIN_TIMEOUT))
-        except Unreachable:
-            raise
-        except RunnerError:
-            return CODEX_NO_ANSWER
-        if found.returncode == 0:
-            return None
-        return {127: CODEX_NOT_INSTALLED, 3: CODEX_NO_SANDBOX}.get(found.returncode, CODEX_LOGGED_OUT)
-
     def prepare_review(self, project, repo, branch, head_sha):
         """Returns a detached checkout of exactly `head_sha`, apart from the worker's worktree."""
         host = self.hosts[project.machine]
@@ -742,17 +480,6 @@ class Runner:
         host.check(["git", "branch", "-D", branch], cwd=path)
         return REMOVED
 
-    def checkout_changed(self, project, cwd, head_sha):
-        """Why the checkout in `cwd` is no longer `head_sha` as it was handed, or None: its head moved, or a tracked
-        file changed, staged or not. New files, untracked or ignored, such as a test cache, do not count."""
-        host = self.hosts[project.machine]
-        at = host.check(["git", "rev-parse", "--verify", "HEAD"], cwd=cwd).strip()
-        if at != head_sha:
-            return f"the checkout moved from {head_sha} to {at}"
-        status = host.check(["git", "status", "--porcelain", "--untracked-files=no"], cwd=cwd)
-        paths = [line[3:] for line in status.splitlines() if line.strip()]
-        return "tracked files changed: " + ", ".join(paths) if paths else None
-
     def run_command(self, project, cwd, command, log_name, secrets=False, scoped=True):
         """Runs a project's command in `cwd` and returns its exit code. Its output stays in a local log.
 
@@ -822,74 +549,66 @@ class Runner:
         return code
 
     def run_agent(self, machine, cwd, prompt, allowed, denied, run_id, should_stop, model=None, tokens=None,
-                  schema=None, resume=None, cli=CLAUDE, temp_files=False):
-        """Runs one agent process to its end, with the agent CLI `cli`; `should_stop` is polled while it runs.
+                  schema=None, resume=None):
+        """Runs one `claude` process to its end; `should_stop` is polled while it runs.
 
         The run is in its own scope (`Host.scoped`): when it ends, or is
         stopped, every process it started on the machine ends with it, over
         SSH too. Where the machine's option is on, the run has its own run
         temporary folder, removed when it ends. With no `model`,
-        the CLI picks its own default. `tokens` is (file, names): those
+        `claude` picks its own default. `tokens` is (file, names): those
         values alone reach this process, in its environment. If one is
-        missing the run ends with an error. With a `schema`, the CLI holds the
+        missing the run ends with an error. With a `schema`, `claude` holds the
         reply to that JSON Schema, and the text is the object it returns.
         With `resume`, the prompt goes to that earlier session in `cwd`.
-        With `temp_files`, a Codex run that may change no file still writes
-        temp files (`TEMP_FILES_LIMITS`); a Claude run is as without it.
         """
-        if cli not in AGENT_CLIS:
-            raise RunnerError(f"not an agent CLI: {cli!r}")
-        host = self.hosts[machine]
-        schema_file = held = None
-        try:
-            if cli == CLAUDE:
-                command, reply = _claude_command(allowed, denied, model, schema, resume), _ClaudeReply()
-            else:
-                schema_file = _put_schema(host, strict_schema(schema)) if schema else None
-                programs = held_programs(denied)
-                command = _codex_command(_codex_limits(host, cwd, allowed, temp_files), model, schema_file, resume,
-                                         held=bool(programs))
-                if programs:
-                    held = _put_held(host, programs)
-                    command = _held(held, command)
-                reply = _CodexReply(model, schema)
-            return self._run(host, cwd, command, prompt, run_id, should_stop, tokens, reply)
-        finally:
-            if schema_file:
-                host.run(["rm", "-f", schema_file])
-            if held:
-                host.run(["rm", "-rf", held])
-
-    def _run(self, host, cwd, command, prompt, run_id, should_stop, tokens, reply):
+        # With no allow list the run may do everything; the deny list still holds.
+        mode = ["--permission-mode", "bypassPermissions"] if allowed is None else \
+            ["--permission-mode", "dontAsk", "--allowedTools", *allowed]
+        command = ["claude", "-p", "--output-format", "stream-json", "--verbose", *mode,
+                   # A repo's own settings must not change what this run may do.
+                   "--setting-sources", "user",
+                   *(["--model", model] if model else []),
+                   *(["--resume", resume] if resume else []),
+                   *(["--json-schema", json.dumps(schema)] if schema else []),
+                   *(["--disallowedTools", *denied] if denied else [])]
         if tokens:
             path, names = tokens
-            script = tokens_script(host.absolute(path), names)
+            script = tokens_script(self.hosts[machine].absolute(path), names)
             command = ["sh", "-c", f'{script}; exec "$@"', "sh", *command]
         self.logs_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(self.logs_dir / f"{run_id}.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        host = self.hosts[machine]
         unit = scope_name(run_id)
         folder = host.run_folder(unit)
         if folder:
-            command = Host.in_run_folder(command, folder, claude=isinstance(reply, _ClaudeReply))
-        started = time.monotonic()
+            command = Host.in_run_folder(command, folder, claude=True)
         process = subprocess.Popen(host.argv(Host.scoped(command, unit), cwd), stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=child_env(run_id))
         stopped = threading.Event()
         threading.Thread(target=self._feed, args=(process, prompt), daemon=True).start()
         threading.Thread(target=self._watch, args=(process, should_stop, stopped), daemon=True).start()
+        result = None
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as log:
                 for line in process.stdout:
                     log.write(line)
                     log.flush()
-                    reply.read(line)
+                    result = _last_result(line, result)
             process.wait()
         finally:
-            # Ends what the run left behind, and over SSH a stopped run's agent at once.
+            # Ends what the run left behind, and over SSH a stopped run's `claude` at once.
             host.stop_scope(unit)
             if folder:
                 host.remove_run_folder(folder)
-        return reply.finish(process.returncode, stopped.is_set(), round((time.monotonic() - started) * 1000))
+        if result is None:
+            return AgentResult(stopped=stopped.is_set())
+        usage = usage_from_result(result)
+        structured = result.get("structured_output")
+        text = json.dumps(structured, ensure_ascii=False) if structured is not None else result.get("result") or ""
+        return AgentResult(text=text, models=usage["models"], duration_ms=usage["duration_ms"],
+                           is_error=usage["is_error"] or process.returncode != 0, stopped=stopped.is_set(),
+                           session_id=result.get("session_id"))
 
     @staticmethod
     def _feed(process, prompt):
