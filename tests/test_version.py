@@ -182,7 +182,9 @@ class PageTest(unittest.TestCase):
 
 class VersionTest(unittest.TestCase):
     def test_the_repo_holds_kandus_version_starting_at_1_0_0(self):
-        self.assertEqual((ROOT / "VERSION").read_text(encoding="utf-8").strip(), "1.0.0")
+        number = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+        self.assertRegex(number, r"^\d+\.\d+\.\d+$")
+        self.assertGreaterEqual(tuple(int(part) for part in number.split(".")), (1, 0, 0))
 
     def test_the_install_reads_the_version_from_the_repo(self):
         self.assertEqual(version.read(), (ROOT / "VERSION").read_text(encoding="utf-8").strip())
