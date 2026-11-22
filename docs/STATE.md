@@ -96,6 +96,9 @@ state/
 | `requests_shown_changed` | `enabled`: the user showed the open requests on the dashboard, or hid them |
 | `clean_merged_changed` | `enabled`: the user turned the cleanup after a merge on or off from the dashboard |
 | `run_tmp_changed` | `machine`, `enabled`, `folder`: the user turned a machine's run temporary folder on or off, or set its folder, from the dashboard |
+| `reference_copy_changed` | `enabled`: the user turned the read-only copy of a task's reference on or off from the dashboard |
+| `reference_copied` | task, project, `repos` (the repos copied), `paths` (how many): a run was given a read-only copy of a reference |
+| `reference_note` | task, project, `note`: why a reference was not, or not wholly, copied; also said once on the task's issue |
 | `parallel_changed` | `total` (or null), `projects`: name → number, for those changed |
 | `kandu_restarted` | none |
 | `wake_requested` | none |
@@ -105,6 +108,10 @@ state/
 | `spec_closed` | `task`, `project`: the last task that names the spec closed, so the spec did too |
 | `deployed` | `task`, `project`, `run_id` |
 | `project_checked` | `project`, `passed`, `detail` |
+| `main_tested` | `project`, `repo`, `commit`, `run` (1 or 2), `passed`, `failing`: one run of the project's tests on a `main` commit, with the failing tests' names the run's log gave; at most two for a commit |
+| `main_red` | `project`, `repo`, `commit`, `failing`, `since`: two runs on this commit failed, so merges wait and no new task starts; `since` is when the red began and stays through later red commits, so the user hears once |
+| `main_green` | `project`, `repo`, `commit`: a commit passed after a red one, so the project is no longer red |
+| `main_fix_opened` | `project`, `repo`, `commit`, `task`, `url`: the one fix task of a red commit |
 | `check_skipped` | `project`, `machine` |
 | `project_inspected` | `project`, `run_id`, `passed`, `findings`, `judged` |
 | `inspect_changed` | `project`, `enabled`, `at` |

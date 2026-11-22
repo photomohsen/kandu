@@ -22,6 +22,7 @@ from .state import StateStore
 TEMPLATE = Path(__file__).resolve().parent.parent / "prompts" / "templates" / "issue.md"
 SPEC_TEMPLATE = TEMPLATE.with_name("spec.md")
 OUT_OF_SCOPE = "Out of scope"
+OPTIONAL_SECTIONS = ("Reference",)  # in the templates, but only for a request to copy or match
 
 
 class TaskError(Exception):
@@ -33,11 +34,11 @@ def _headings(path):
 
 
 def required_sections():
-    return _headings(TEMPLATE)
+    return [h for h in _headings(TEMPLATE) if h not in OPTIONAL_SECTIONS]
 
 
 def spec_sections():
-    return _headings(SPEC_TEMPLATE)
+    return [h for h in _headings(SPEC_TEMPLATE) if h not in OPTIONAL_SECTIONS]
 
 
 def _check_sections(body, required, what):
@@ -214,6 +215,27 @@ def spec_key(reference, repo):
     if match is None:
         raise TaskError("--spec takes the spec issue as #12 or owner/repo#12")
     return f"{match.group(1) or repo}#{match.group(2)}"
+
+
+SPEC_LINE = re.compile(r"\A\s*Spec: (?:([\w.-]+/[\w.-]+))?#(\d+)")
+SPEC_FOR_AGENTS = ("Solution", "Decisions", "Reference")
+
+
+def named_spec(body, repo):
+    """The spec a task's body names at its top, as `owner/repo#12`, or None. A bare `#12` is in `repo`."""
+    match = SPEC_LINE.match(body or "")
+    return f"{match.group(1) or repo}#{match.group(2)}" if match else None
+
+
+def spec_for_agents(spec_body):
+    """The parts of a spec that bind its task's agents (Solution, Decisions, Reference), as `###` sections;
+    a section the spec lacks is left out."""
+    parts = []
+    for name in SPEC_FOR_AGENTS:
+        text = section_text(spec_body, name)
+        if text is not None and text.strip():
+            parts.append(f"### {name}\n{text.strip()}")
+    return "\n\n".join(parts)
 
 
 def with_spec(github, store, project, repo, body, reference):

@@ -15,7 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from kandu import agents, notify, queen, questions, review, split, supervisor, tasks
+from kandu import agents, merge, notify, queen, questions, review, split, supervisor, tasks
 from kandu.config import Rules, load_config
 from kandu.flights import Flights, task_key
 from kandu.notify import Notifier
@@ -90,6 +90,10 @@ class FakeGitHub:
         issue = next((i for i in self.items if i.number == number), None)
         return {"title": issue.title if issue else "", "body": issue.body if issue else "",
                 "blocked_by": issue.blocked_by if issue else []}
+
+    def copied_issue_text(self, repo, number):
+        issue = next((i for i in self.items if (i.repo, i.number) == (repo, number)), None)
+        return None if issue is None else {"title": issue.title, "body": issue.body}
 
     def item(self, repo, number):
         issue = next(i for i in self.items if (i.repo, i.number) == (repo, number))
@@ -232,6 +236,10 @@ class FakeRunner:
         self.merged = []
         self.on_push = lambda: None
         self.heads_at_merge = {}
+        self.failure_names = []  # what the failing test run's log names
+
+    def test_failures(self, log_name):
+        return list(self.failure_names)
 
     def merge_base(self, project, repo, directory, branch, base, message, kept=None):
         self.merged.append((directory, base))
@@ -634,6 +642,44 @@ class PausedOnTheDashboardTest(Base):
         self.assertIn("IMAGE_API_KEY", token_run.prompt)
         self.assertIsNone(plain_run.tokens)
         self.assertNotIn("IMAGE_API_KEY", plain_run.prompt)
+
+    SPEC = ("## Problem\nP-TEXT\n\n## Solution\nSOLUTION-TEXT\n\n## Decisions\n- DECISION-TEXT\n\n"
+            "## Reference\nREFERENCE-TEXT\n\n## Out of scope\nOUT-TEXT\n")
+
+    def spec_runs(self, task_body, spec_in_copy=True):
+        if spec_in_copy:
+            self.github.add(9, labels=(), body=self.SPEC)
+        self.github.add(1, body=task_body)
+        task = read_tasks(self.config, self.github)[0]
+        self.sup.workers[task.key] = {}
+        self.runner.steps = [PR_OPENED]
+        self.sup._work(task)
+        return self.runner.runs[0].prompt
+
+    def test_a_task_of_a_spec_gives_its_worker_the_spec_from_the_copy(self):
+        prompt = self.spec_runs("Spec: #9\n\n## Goal\nG\n")
+        for part in ("SOLUTION-TEXT", "DECISION-TEXT", "REFERENCE-TEXT", "contradicts one is out of bounds"):
+            self.assertIn(part, prompt)
+        self.assertNotIn("P-TEXT", prompt)
+        self.assertNotIn("OUT-TEXT", prompt)
+        self.assertEqual(self.decisions("spec_unreadable"), [])
+
+    def test_a_task_with_no_spec_gets_no_spec_section(self):
+        prompt = self.spec_runs("## Goal\nG\n")
+        self.assertNotIn("## The task's spec", prompt)
+        self.assertEqual(self.decisions("spec_unreadable"), [])
+
+    def test_a_named_spec_missing_from_the_copy_is_said_and_the_prompt_goes_without_it(self):
+        prompt = self.spec_runs("Spec: #9\n\n## Goal\nG\n", spec_in_copy=False)
+        self.assertNotIn("## The task's spec", prompt)
+        self.assertEqual(len(self.decisions("spec_unreadable")), 1)
+
+    def test_the_reviewer_and_the_splitter_get_the_spec_too(self):
+        self.github.add(9, labels=(), body=self.SPEC)
+        self.github.add(1, body="Spec: #9\n\n## Goal\nG\n")
+        task = read_tasks(self.config, self.github)[0]
+        self.assertIn("DECISION-TEXT", agents.splitter_prompt(task.project, task.repo, 1, "en", self.local,
+                                                              spec=self.sup._spec(task)))
 
     def test_the_label_gives_nothing_in_a_project_without_tokens(self):
         self.config.projects[0].task_tokens = {}
@@ -2822,6 +2868,100 @@ class MergeTest(Base):
         self.cycle()
         self.assertEqual(self.github.merges, [])
         self.assertIn("tests fail", self.events("decision")[-1]["reason"])
+
+    def cycle_while_testing(self, project):
+        """One cycle while another PR's merge test of `project` is going."""
+        self.sup = self.new_supervisor()
+        self.sup._test_locks[project].acquire()
+        return self.sup.cycle()
+
+    def test_a_pr_waits_while_another_merge_test_of_its_project_runs(self):
+        self.runner.steps = [report(SHA1)]
+        self.cycle_while_testing("website")
+        self.assertEqual(self.github.merges, [])
+        self.assertNotIn("npm test", [c for c, _ in self.runner.commands])
+        reason = self.events("decision")[-1]["reason"]
+        self.assertIn("another merge test of this project is running", reason)
+        self.assertNotIn("tests fail", reason)
+
+    def test_a_pr_waiting_for_a_test_run_is_tested_in_a_later_cycle(self):
+        self.runner.steps = [report(SHA1)]
+        self.cycle_while_testing("website")
+        self.cycle()
+        self.assertEqual(len(self.github.merges), 1)
+
+    def test_a_test_run_of_another_project_does_not_hold_a_merge(self):
+        self.runner.steps = [report(SHA1)]
+        self.cycle_while_testing("internal-tool")
+        self.assertEqual(len(self.github.merges), 1)
+
+    def test_the_test_lock_is_free_after_a_run(self):
+        self.runner.steps = [report(SHA1)]
+        self.cycle()
+        self.assertTrue(self.sup._test_locks["website"].acquire(blocking=False))
+
+    def test_a_head_whose_tests_failed_twice_is_not_tested_a_third_time(self):
+        self.runner.failing = {"npm test"}
+        self.runner.steps = [report(SHA1)]
+        for _ in range(5):
+            self.cycle()
+        runs = [c for c in self.runner.commands if c[0] == "npm test"]
+        self.assertEqual(len(runs), 2)
+        self.assertEqual(self.github.merges, [])
+        self.assertEqual(self.events("decision")[-1]["reason"], merge.TESTS_WAIT)
+
+    def fail_twice(self):
+        self.runner.failing = {"npm test"}
+        self.runner.steps = [report(SHA1)]
+        for _ in range(3):
+            self.cycle()
+        self.runner.commands.clear()
+
+    def test_a_recorded_test_again_request_tests_the_head_again(self):
+        self.fail_twice()
+        self.store.record("tests_again_requested", task=KEY, project="website", head_sha=SHA1)
+        self.cycle()
+        self.cycle()
+        self.cycle()
+        self.assertEqual(len([c for c in self.runner.commands if c[0] == "npm test"]), 2)
+
+    def test_a_new_head_tests_again_with_its_own_one_more_try(self):
+        self.fail_twice()
+        self.assertTrue(self.sup._tests_wait(KEY, SHA1))
+        self.assertFalse(self.sup._tests_wait(KEY, SHA2))
+
+    def test_the_queens_verify_is_refused_while_the_head_waits_on_its_tests(self):
+        self.fail_twice()
+        refused, _ = self.sup._carry_out([{"task": KEY, "action": "verify", "note": "Run the tests."}], [])
+        self.assertEqual(len(refused), 1)
+        self.assertIn("the tests failed twice on this head", refused[0])
+        self.store.record("tests_again_requested", task=KEY, project="website", head_sha=SHA1)
+        refused, _ = self.sup._carry_out([{"task": KEY, "action": "verify", "note": "Run the tests."}], [])
+        self.assertEqual(refused, [])
+
+    def test_the_gate_logs_each_run_of_the_tests_on_a_head(self):
+        self.waits("one-way", report(SHA1, door="one-way"))
+        self.approve()
+        self.runner.failing = {"npm test"}
+        self.cycle()
+        self.assertEqual(self.events("tests_failed")[-1]["head_sha"], SHA1)
+        self.runner.failing = set()
+        self.cycle()
+        self.assertEqual(self.events("tests_passed")[-1]["head_sha"], SHA1)
+
+    def test_a_test_again_request_makes_the_next_cycle_run_the_tests_on_a_waiting_head(self):
+        self.waits("one-way", report(SHA1, door="one-way"))
+        self.approve()
+        self.runner.failing = {"npm test"}
+        self.cycle()
+        self.cycle()
+        self.assertEqual(len(self.events("tests_failed")), 2)
+        self.cycle()
+        self.assertEqual(len(self.events("tests_failed")), 2)  # waiting: nothing runs
+        self.store.record("tests_again_requested", task=f"{REPO}#1", project="website", head_sha=SHA1)
+        self.cycle()
+        self.assertEqual(len(self.events("tests_failed")), 3)
+        self.assertEqual(self.github.merges, [])
 
     def test_failing_ci_waits(self):
         self.github.prs[(REPO, 1)]["statusCheckRollup"] = [{"conclusion": "FAILURE"}]

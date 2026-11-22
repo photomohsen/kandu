@@ -6,6 +6,7 @@ above them, are started only for work that needs judgment. No state is kept betw
 board and the PR hold, so a cycle that is cut off resumes where it stopped.
 """
 import argparse
+import contextlib
 import fcntl
 import json
 import secrets
@@ -21,13 +22,13 @@ from datetime import datetime, timedelta
 
 from pathlib import Path
 
-from . import agents, clean, debt, merge, queen, questions, review, show, sizing, split, tasks, waits
+from . import agents, clean, debt, mainred, merge, queen, questions, reference, review, show, sizing, split, tasks, waits
 from .config import DEFAULT_LOCAL_DIR, TECHNICAL_DEBT, ConfigError, load_config
 from .flights import Flights
 from .github import BREAKING_LABEL, TOKENS_LABEL, GitHubError, blockers_in, branch_for, task_blockers, transient
 from .mirror import open_github
 from .notify import CHECK_NOT_RUN, LIVE_DOWN, TESTS_FAIL_IN, notifier_for
-from .runner import DEFAULT_LOGS_DIR, LocalWork, Runner, RunnerError, Unreachable
+from .runner import DEFAULT_LOGS_DIR, LocalWork, ReferenceTooBig, Runner, RunnerError, Unreachable
 from .state import StateStore
 from .tasks import TaskError
 from .tries import FAILURE_COMMENT, INTERNAL_TRIES, SIZING_FAILURE_COMMENT, count as count_tries
@@ -51,6 +52,7 @@ STOPPED_BY_USER = "stopped by the user"
 CUT_OFF = "cycle time ran out while an agent was running"
 RETRYING = "GitHub refused the merge for a moment; Kandu tries it again by itself"
 WAITS_FOR_BLOCKER = "blocker {} is not merged yet"
+WAITS_FOR_TEST_RUN = waits.TEST_RUN_BUSY
 ROOT = Path(__file__).resolve().parent.parent
 UNREAD_PR_BODY = ("The worker pushed this branch, but Kandu could not read its last message, so this description "
                   "is Kandu's. The review reads the code.")
@@ -251,6 +253,8 @@ class Supervisor:
         self.next_wake = None
         self._lock = threading.Lock()
         self._deploy_locks = defaultdict(threading.Lock)
+        self._main_lock = threading.Lock()  # one test of `main` at a time, so a commit is tested at most twice
+        self._test_locks = defaultdict(threading.Lock)  # project name -> held while its merge test runs
 
     def _is_paused(self, project):
         return project.paused or project.name in self.store.paused_projects()
@@ -429,6 +433,91 @@ class Supervisor:
             return None
         return lambda repo, number: show.render(self.github.item(repo, number))
 
+    def _note_reference(self, task, notes):
+        """Says on the task why a reference was not, or not wholly, copied. Each note once, in no run's words: the
+        issue may be on a public repo, so no repo or path is named."""
+        for note in notes:
+            if self.store.last_event("reference_note", task=task.key, project=task.project.name, note=note):
+                continue
+            self.store.record("reference_note", task=task.key, project=task.project.name, note=note)
+            try:
+                self.github.comment_issue(task.repo, task.number, f"Kandu could not give the run a copy of the "
+                                          f"task's reference. {note}")
+            except GitHubError as e:
+                self._decide(task, "internal_error", f"could not post a reference note: {e}")
+
+    @contextlib.contextmanager
+    def _reference(self, task):
+        """Gives a run the read-only copy of the task's `Reference`: yields (folder, prompt text), or (None, None).
+
+        Only with `reference_copy` on. A reference it cannot copy never stops the run: it leaves a note on the task
+        and the run goes on without it. The folder is removed when the run ends, however it ends.
+        """
+        folder = None
+        try:
+            if self.config.settings.supervisor.reference_copy:
+                folder, text = self._copy_reference(task)
+            else:
+                text = None
+            yield (folder, text) if text else (None, None)
+        finally:
+            if folder is not None:
+                self.runner.remove_reference_folder(task.project, folder)
+
+    def _copy_reference(self, task):
+        body = self.github.issue_text(task.repo, task.number)["body"]
+        wanted, notes = reference.plan(task.repo, body, self.config.projects, self.github.repo_is_public)
+        folder, copied = None, []
+        try:
+            for source, ref, number in wanted:
+                if folder is None:
+                    folder = self.runner.make_reference_folder(task.project)
+                try:
+                    done, missing = self.runner.copy_reference(source, ref.repo, ref.paths, task.project, folder)
+                except Unreachable:
+                    notes.append(f"Reference {number}: {reference.UNREACHABLE}.")
+                    continue
+                except ReferenceTooBig:
+                    notes.append(f"Reference {number}: {reference.TOO_BIG}.")
+                    continue
+                except RunnerError:
+                    notes.append(f"Reference {number}: {reference.UNREADABLE}.")
+                    continue
+                if missing:
+                    notes.append(f"Reference {number}: {reference.MISSING_PATH}.")
+                if done:
+                    copied.append((ref.repo, done))
+        except BaseException:
+            if folder is not None:
+                self.runner.remove_reference_folder(task.project, folder)
+            raise
+        if folder is not None:
+            self.store.record("reference_copied", task=task.key, project=task.project.name,
+                              repos=[repo for repo, _ in copied], paths=sum(len(p) for _, p in copied))
+        self._note_reference(task, notes)
+        if not copied:
+            if folder is not None:
+                self.runner.remove_reference_folder(task.project, folder)
+            return None, None
+        return folder, reference.prompt_section(folder, copied)
+
+    def _spec(self, task):
+        """The Solution, Decisions and Reference of the spec the task names, read from Kandu's copy alone, for its
+        agents' prompts; None when the task names no spec. A named spec the copy cannot give is recorded and the
+        prompt goes without it."""
+        body = (self.github.copied_issue_text(task.repo, task.number) or {}).get("body", "")
+        key = tasks.named_spec(body, task.repo)
+        if key is None:
+            return None
+        repo, _, number = key.partition("#")
+        spec = self.github.copied_issue_text(repo, int(number))
+        text = tasks.spec_for_agents(spec["body"]) if spec else ""
+        if not text:
+            self._decide(task, "spec_unreadable", f"the spec {key} is not in Kandu's copy or holds none of "
+                         f"{', '.join(tasks.SPEC_FOR_AGENTS)}; the agent works without it")
+            return None
+        return text
+
     def _agent(self, task, role, cwd, prompt, tools, run_id, tokens=None, schema=None, resume=None):
         if self._stopping():
             raise CycleStop(STOPPED_BY_USER)  # not kept for the cycle: a resume lets the rest go on
@@ -489,16 +578,18 @@ class Supervisor:
             cwd = self._worktree(task, self.github.default_branch(task.repo))
         note = queen.note_for(queen.all_events(self.store), task.key)
         blockers = open_blockers(self.github, task.repo, self.github.issue_text(task.repo, task.number))
-        prompt = agents.worker_prompt(task.project, task.repo, task.number, task.branch, run_id,
-                                      findings=findings, pr=pr, local_dir=self.local_dir,
-                                      queen_note=note, tokens=task.tokens, open_blockers=blockers, order=order,
-                                      copy=self._copy(task.project))
         project = task.project
         tokens = (project.secrets_from, list(project.task_tokens)) if task.tokens else None
-        tools = agents.worker_tools(project, task.branch, self._rules("worker"), self._remote(project))
-        result = self._agent(task, "worker", cwd, prompt, tools, run_id, tokens, agents.WORKER_SCHEMA)
-        read = agents.parse_worker_reply if pr is not None else agents.parse_first_reply
-        return self._reply(task, "worker", cwd, tools, result, read, tokens, agents.WORKER_SCHEMA)
+        with self._reference(task) as (folder, copied):
+            prompt = agents.worker_prompt(task.project, task.repo, task.number, task.branch, run_id,
+                                          findings=findings, pr=pr, local_dir=self.local_dir,
+                                          queen_note=note, tokens=task.tokens, open_blockers=blockers, order=order,
+                                          copy=self._copy(task.project), reference=copied,
+                                          spec=self._spec(task))
+            tools = agents.worker_tools(project, task.branch, self._rules("worker"), self._remote(project), folder)
+            result = self._agent(task, "worker", cwd, prompt, tools, run_id, tokens, agents.WORKER_SCHEMA)
+            read = agents.parse_worker_reply if pr is not None else agents.parse_first_reply
+            return self._reply(task, "worker", cwd, tools, result, read, tokens, agents.WORKER_SCHEMA)
 
     def _open_pr(self, task, reply):
         """Kandu opens the PR, from the task's own branch into the default one, with the worker's title and
@@ -612,31 +703,33 @@ class Supervisor:
         language = self.config.settings.language
         run_id = new_run_id(self.now())
         cwd = self.runner.prepare_review(task.project, task.repo, task.branch, head)
-        if to_fix:
-            prompt = agents.second_review_prompt(task.repo, task.number, pr["number"], head, language, to_fix,
-                                                 self.github.default_branch(task.repo), self._copy(task.project))
-        else:
-            criteria = sizing.criteria_list(self.github.issue_text(task.repo, task.number)["body"])
-            first_n = 1 + max((f["n"] for r in reviews for f in r["open"]), default=0)
-            companions = self.github.companions(task.repo, pr, self._family_repos(task.project))
-            prompt = agents.reviewer_prompt(task.project, task.repo, task.number, pr["number"], head, language,
-                                            companions, criteria, first_n, self.github.default_branch(task.repo),
-                                            local_dir=self.local_dir, copy=self._copy(task.project))
-        tools = agents.reviewer_tools(task.project, self._rules("reviewer"), self._remote(task.project))
-        result = self._agent(task, "reviewer", cwd, prompt, tools, run_id, schema=review.REPORT_SCHEMA)
-
         stale = []
 
         def read(text):
             report = review.parse_report(text)
             stale[:] = review.validate_report(report, to_fix, second=bool(to_fix))
             return report
-        try:
-            report = self._reply(task, "reviewer", cwd, tools, result, read, schema=review.REPORT_SCHEMA)
-            dropped = (review.carry_over(report, reviews[-1], to_fix) if to_fix else
-                       review.hold_to_scope(report, criteria, [f["path"] for f in pr["files"]]))
-        except review.ReportError as e:
-            raise KanduTrouble(f"reviewer run {run_id}: {e}") from e
+        with self._reference(task) as (folder, copied):
+            if to_fix:
+                prompt = agents.second_review_prompt(task.repo, task.number, pr["number"], head, language, to_fix,
+                                                     self.github.default_branch(task.repo), self._copy(task.project),
+                                                     reference=copied, spec=self._spec(task))
+            else:
+                criteria = sizing.criteria_list(self.github.issue_text(task.repo, task.number)["body"])
+                first_n = 1 + max((f["n"] for r in reviews for f in r["open"]), default=0)
+                companions = self.github.companions(task.repo, pr, self._family_repos(task.project))
+                prompt = agents.reviewer_prompt(task.project, task.repo, task.number, pr["number"], head, language,
+                                                companions, criteria, first_n, self.github.default_branch(task.repo),
+                                                local_dir=self.local_dir, copy=self._copy(task.project),
+                                                reference=copied, spec=self._spec(task))
+            tools = agents.reviewer_tools(task.project, self._rules("reviewer"), self._remote(task.project), folder)
+            result = self._agent(task, "reviewer", cwd, prompt, tools, run_id, schema=review.REPORT_SCHEMA)
+            try:
+                report = self._reply(task, "reviewer", cwd, tools, result, read, schema=review.REPORT_SCHEMA)
+                dropped = (review.carry_over(report, reviews[-1], to_fix) if to_fix else
+                           review.hold_to_scope(report, criteria, [f["path"] for f in pr["files"]]))
+            except review.ReportError as e:
+                raise KanduTrouble(f"reviewer run {run_id}: {e}") from e
         if report["head_sha"] != head:
             self._decide(task, "review_voided", "the head moved during the review")
             return
@@ -970,11 +1063,115 @@ class Supervisor:
         if waits.CI_FAILING in reasons:  # each failing check by name, with its link, so the user sees where
             reasons += waits.check_reasons(pr.get("statusCheckRollup"))
         reasons += [WAITS_FOR_BLOCKER.format(key) for key in self._open_blockers(task)]
+        if self._main_is_red(task):
+            reasons.append(mainred.RED_REASON)
         if reasons:
             return reasons
-        cwd = self.runner.prepare_review(task.project, task.repo, task.branch, head)
-        code = self.runner.run_test(task.project, cwd, new_run_id(self.now()))
-        return [] if code == 0 else ["the tests fail on this head"]
+        if self._tests_wait(task.key, head):
+            return [merge.TESTS_WAIT]  # the tests are not run again on this head
+        # One merge test at a time per project: slow tests time out when they share the machine. A PR whose turn
+        # has not come waits for a later look, and this is no failed run.
+        lock = self._test_locks[task.project.name]
+        if not lock.acquire(blocking=False):
+            return [WAITS_FOR_TEST_RUN]
+        try:
+            cwd = self.runner.prepare_review(task.project, task.repo, task.branch, head)
+            code = self.runner.run_test(task.project, cwd, new_run_id(self.now()))
+        finally:
+            lock.release()
+        if code == 0:
+            self.store.record("tests_passed", task=task.key, project=task.project.name, head_sha=head)
+            return []
+        self.store.record("tests_failed", task=task.key, project=task.project.name, head_sha=head)
+        if self.store.project_setting(task.project, "watch_main"):
+            self._check_main(task.project, task.repo)
+            if self._main_is_red(task):
+                return [mainred.RED_REASON]
+        return [merge.TESTS_WAIT if self._tests_wait(task.key, head) else merge.TESTS_FAIL]
+
+    def _tests_wait(self, key, head):
+        """True when this head's tests failed twice in the merge gate and nothing has asked for them since."""
+        events = [e for day in self.store.days() for e in self.store.events(day)]
+        return merge.tests_wait(events, key, head)
+
+    # A project whose `main` is red (mainred.py).
+
+    def _main_is_red(self, task):
+        """True when the project watches `main`, it is red, and this is not the task that fixes it."""
+        project = task.project
+        return (bool(self.store.project_setting(project, "watch_main")) and task.key not in mainred.fix_tasks(self.store, project)
+                and bool(mainred.red_events(self.store, project)))
+
+    def _check_main(self, project, repo):
+        """Tests the current `main` of `repo` until its commit is decided: at most two runs, kept per commit.
+        `main` is red only when both fail, and a pass ends a red one."""
+        base = self.github.default_branch(repo)
+        with self._main_lock:
+            commit = self.github.branch_tip(repo, base)
+            if commit is None:
+                return
+            kept = mainred.runs(self.store, project, repo, commit)
+            while not mainred.decided(kept):
+                cwd = self.runner.prepare_review(project, repo, "kandu/main-check", commit)
+                log = new_run_id(self.now())
+                passed = self.runner.run_test(project, cwd, log) == 0
+                self.store.record("main_tested", project=project.name, repo=repo, commit=commit, run=len(kept) + 1,
+                                  passed=passed, failing=[] if passed else self.runner.test_failures(log))
+                kept = mainred.runs(self.store, project, repo, commit)
+            current = mainred.red(self.store, project, repo)
+            if mainred.is_red(kept):
+                if current is None or current["commit"] != commit:
+                    self._declare_red(project, repo, commit, kept, current)
+                if not mainred.fix_opened(self.store, project, repo, commit):
+                    self._open_fix_task(project, repo, commit, kept)  # also retries one that failed before
+            elif current is not None and any(r["passed"] for r in kept):
+                self.store.record("main_green", project=project.name, repo=repo, commit=commit)
+
+    def _declare_red(self, project, repo, commit, kept, current):
+        """Records the red `main`. The user hears once while it stays red: a commit that is red after another keeps
+        the first one's `since`."""
+        failing = list(dict.fromkeys(name for run in kept for name in run["failing"]))
+        since = current["since"] if current is not None else self.now().isoformat(timespec="seconds")
+        self.store.record("main_red", project=project.name, repo=repo, commit=commit, failing=failing, since=since)
+
+    def _open_fix_task(self, project, repo, commit, kept):
+        """Opens the one fix task of a red commit; a failure leaves it unopened, so the next look tries again."""
+        failing = list(dict.fromkeys(name for run in kept for name in run["failing"]))
+        title = f"Fix the failing tests on main of {repo.split('/')[-1]}"
+        body = mainred.fix_body(repo, commit, failing, project.test)
+
+        def created(url):
+            number = url.rstrip().rsplit("/", 1)[1]
+            self.store.record("main_fix_opened", project=project.name, repo=repo, commit=commit,
+                              task=f"{repo}#{number}", url=url.strip())
+        try:
+            url = tasks.create_task(self.config, self.github, project.name, repo, title, body, self.local_dir,
+                                    "High", "Bug", "Small", created=created, store=self.store)
+        except TaskError as e:
+            raise KanduTrouble(f"could not open the task that fixes main: {e}") from e
+        self.github.set_status(project.board, url, READY)  # it starts even while `main` is red
+
+    def _watch_main(self):
+        """A red `main` is tested again once its commit changed, so a fix that landed ends the red."""
+        for project in self.config.projects:
+            if (not self.store.project_setting(project, "watch_main") or self._is_paused(project) or self._stopping()
+                    or not self._reachable(project.machine)):
+                continue
+            for repo in project.repos:
+                current = mainred.red(self.store, project, repo)
+                try:
+                    if current is not None and (self.github.branch_tip(repo, self.github.default_branch(repo)) != current["commit"]
+                                                or not mainred.fix_opened(self.store, project, repo, current["commit"])):
+                        self._check_main(project, repo)
+                except (GitHubError, RunnerError, KanduTrouble):
+                    continue  # the next cycle looks again
+
+    def _not_while_red(self, tasks):
+        """While a project's `main` is red, no task of it starts except the one that fixes it; those at work go on."""
+        red = {p.name for p in self.config.projects
+               if self.store.project_setting(p, "watch_main") and mainred.red_events(self.store, p)}
+        fixes = {p.name: mainred.fix_tasks(self.store, p) for p in self.config.projects if p.name in red}
+        return [t for t in tasks if not (t.status == READY and t.project.name in red and t.key not in fixes[t.project.name])]
 
     def _holds(self, task, pr):
         """What holds a settled PR's merge whatever the user says: a failing check or an open blocker. They are
@@ -1328,7 +1525,7 @@ class Supervisor:
             base = self.github.default_branch(task.repo)
             cwd = self.runner.prepare_review(task.project, task.repo, f"kandu/size-{task.number}", f"origin/{base}")
             prompt = agents.splitter_prompt(task.project, task.repo, task.number, self.config.settings.language,
-                                            self.local_dir, self._copy(task.project))
+                                            self.local_dir, self._copy(task.project), self._spec(task))
             tools = agents.role_tools(self._rules("splitter"), self._remote(task.project))
             result = self._agent(task, "splitter", cwd, prompt, tools, run_id, schema=agents.SPLIT_SCHEMA)
 
@@ -1847,6 +2044,8 @@ class Supervisor:
                 self.github.set_status(project.board, item.url, IN_PROGRESS)
             return why
         if action == "verify":
+            if pr is not None and pr["state"] == "OPEN" and self._tests_wait(task, pr["headRefOid"]):
+                return merge.TESTS_WAIT + ": a check on this head waits too"
             return None  # carried out when code next drives the task; see `_sent_on`
         if action == "block_on":
             return self._block_on(item, task, decision["on"])
@@ -2024,7 +2223,7 @@ class Supervisor:
             ready = [t for t in read if t.status == READY] + self._sent_on()
             ready = [t for t in ready if t.key not in seen]
             ready += [t for t in read if t.status == IN_REVIEW and t.key not in busy and self._yes_came(t.key)]
-            tasks = self._reachable_tasks(list({t.key: t for t in ready}.values()))
+            tasks = self._reachable_tasks(self._not_while_red(list({t.key: t for t in ready}.values())))
         except (GitHubError, RunnerError) as e:
             self.queen_trouble = type(e).__name__
             return []
@@ -2102,6 +2301,7 @@ class Supervisor:
                 self._close_groups()
                 self._close_specs()
                 self._size_backlog()
+                self._watch_main()
                 self._tell_stuck_cards()
                 self._queen()
             except (GitHubError, RunnerError) as e:
@@ -2143,6 +2343,7 @@ class Supervisor:
             tasks += [t for t in self._sent_on() if t.key not in {other.key for other in tasks}]
         except GitHubError as e:
             return f"could not read the boards: {e}"
+        tasks = self._not_while_red(tasks)
         if not tasks:
             return "nothing ready"
         tasks = self._reachable_tasks(tasks)

@@ -27,6 +27,8 @@ EVENT_FIELDS = {
     "phase_changed": TASK_FIELDS + ("phase",),
     "decision": TASK_FIELDS + ("decision", "reason"),
     "merge_held": TASK_FIELDS + ("head_sha", "blockers"),
+    "tests_failed": TASK_FIELDS + ("head_sha",),
+    "tests_again_requested": TASK_FIELDS + ("head_sha",),
     "worker_pushed": TASK_FIELDS + ("branch", "pr_title", "pr_body"),
     "merge_retry": TASK_FIELDS + ("head_sha", "next_try", "reason"),
     "run_finished": TASK_FIELDS + ("run_id", "role", "models", "duration_ms", "is_error"),
@@ -36,6 +38,7 @@ EVENT_FIELDS = {
     "debt_reported": TASK_FIELDS + ("finding", "title", "body", "size", "reason"),
     "debt_parked": TASK_FIELDS + ("finding", "url", "note"),
     "user_approved": TASK_FIELDS + ("head_sha",),
+    "tests_passed": TASK_FIELDS + ("head_sha",),  # the merge gate's tests passed on a head
     "user_resumed": TASK_FIELDS + ("to",),
     "queen_approved": TASK_FIELDS + ("head_sha", "note"),
     "queen_accepted_split": TASK_FIELDS + ("children", "note"),
@@ -65,6 +68,10 @@ EVENT_FIELDS = {
     "project_resumed": ("project",),
     "project_setting_changed": ("project", "setting", "old", "new"),
     "project_setting_carried": ("project", "setting", "value"),
+    "main_tested": ("project", "repo", "commit", "run", "passed", "failing"),  # one run of the tests on a `main` commit
+    "main_red": ("project", "repo", "commit", "failing", "since"),  # two runs on one commit failed: merges wait
+    "main_green": ("project", "repo", "commit"),  # a `main` commit passed after a red one
+    "main_fix_opened": ("project", "repo", "commit", "task", "url"),  # the one fix task of a red commit
     "limits_changed": ("session", "week"),
     "parallel_changed": ("total", "projects"),
     "drop_blockers_changed": ("enabled",),
@@ -92,6 +99,9 @@ EVENT_FIELDS = {
     "flight_ended": TASK_FIELDS + ("reason",),  # a quiet free flight on a merged task, ended by the cleanup
     "flight_left_open": TASK_FIELDS + ("session",),  # a task closed without a merge while its free flight is open
     "clean_merged_changed": ("enabled",),
+    "reference_copy_changed": ("enabled",),
+    "reference_copied": TASK_FIELDS + ("repos", "paths"),   # a run was given a read-only copy of a reference
+    "reference_note": TASK_FIELDS + ("note",),               # why a reference was not copied, said once on the task
     "run_tmp_changed": ("machine", "enabled", "folder"),
     "project_added": ("project",),
     "project_removed": ("project",),
@@ -109,7 +119,8 @@ EVENT_FIELDS = {
     "upgrade_read": ("version",),  # the user marked the upgrade notice as read, up to this version
 }
 # Each setting a project may have in the dashboard's settings section, with its values. One there wins over the registry.
-PROJECT_SETTINGS = {"split_approval": SPLIT_APPROVALS, "queen_answers_one_way": (True, False)}
+PROJECT_SETTINGS = {"split_approval": SPLIT_APPROVALS, "queen_answers_one_way": (True, False),
+                    "watch_main": (True, False)}
 # Carried once, on the first cycle after the switch came, for the projects an install had: today's behaviour stays.
 CARRIED_SETTINGS = {"queen_answers_one_way": True}
 
