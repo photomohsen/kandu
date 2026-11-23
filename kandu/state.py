@@ -73,6 +73,7 @@ EVENT_FIELDS = {
     "main_green": ("project", "repo", "commit"),  # a `main` commit passed after a red one
     "base_missing": ("project", "branch", "repos"),  # GitHub lacks the project's base branch: none of its tasks starts
     "base_found": ("project", "branch"),  # the missing base branch is on GitHub again
+    "main_updated": ("project", "repo", "commit", "task"),  # `main` was brought into a PR that waited on a red one
     "main_fix_opened": ("project", "repo", "commit", "task", "url"),  # the one fix task of a red commit
     "limits_changed": ("session", "week"),
     "parallel_changed": ("total", "projects"),

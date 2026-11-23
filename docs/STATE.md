@@ -114,6 +114,7 @@ state/
 | `base_missing` | `project`, `branch`, `repos`: the base branch the project names is not on GitHub in these repos, so none of its tasks starts; recorded when found missing, and again only when the branch or the repos change |
 | `base_found` | `project`, `branch`: the missing base branch is on GitHub again, so the project's tasks start again |
 | `main_fix_opened` | `project`, `repo`, `commit`, `task`, `url`: the one fix task of a red commit |
+| `main_updated` | `project`, `repo`, `commit`, `task`: `main` was brought into a PR that waited on a red one |
 | `check_skipped` | `project`, `machine` |
 | `project_inspected` | `project`, `run_id`, `passed`, `findings`, `judged` |
 | `inspect_changed` | `project`, `enabled`, `at` |
